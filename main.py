@@ -107,8 +107,9 @@ LOGOUT_REDIRECT_URL: str = os.environ.get("LOGOUT_REDIRECT_URL", "")
 SMB_CORPORATE_ID: str = os.environ.get("SMB_CORPORATE_ID", "").strip()
 
 # Allow redirect_uri on the same platform domain (any subdomain). The callback
-# host is e.g. auth.moneta.askii.ai → platform suffix is .moneta.askii.ai, so
-# design-mcp.moneta.askii.ai, docs-mcp.moneta.askii.ai etc. are all accepted.
+# host is e.g. auth.<platform-domain> → platform suffix is .<platform-domain>,
+# so design-mcp.<platform-domain>, docs-mcp.<platform-domain> etc. are all
+# accepted.
 _CALLBACK_HOST: str = urlparse(MPASS_CALLBACK_URL).netloc
 _PLATFORM_DOMAIN_SUFFIX: str = _CALLBACK_HOST.removeprefix("auth")
 
@@ -183,7 +184,7 @@ def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
 def _clear_bridge_cookie(response: Response) -> Response:
     """Idempotent mpass_bridge cleanup. Called on every /mpass-callback exit
     path (success + failure) so a stale bridge cookie doesn't linger after
-    Tab A consumed the Redis state for Tab B's flow (FOSSSMBBUN-88)."""
+    Tab A consumed the Redis state for Tab B's flow."""
     response.delete_cookie("mpass_bridge", domain=COOKIE_DOMAIN, path="/")
     return response
 

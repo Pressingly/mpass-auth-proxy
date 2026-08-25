@@ -680,7 +680,7 @@ class TestTokenEndpointDiscovery:
         assert call_count["n"] == 1, "discovery doc should only be fetched once"
 
     def test_refresh_uses_discovered_url_not_issuer(self, monkeypatch):
-        """Regression test for PR #34 bug: refresh must POST to the discovered
+        """Regression test: refresh must POST to the discovered
         token_endpoint, not to OIDC_ISSUER_URL + '/oauth2/token'."""
         captured = {}
 

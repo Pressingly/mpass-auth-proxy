@@ -24,14 +24,24 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/mpass/logout` | Clears the `mpass_bridge` cookie, then `302` to `/oauth2/sign_out`, optionally chaining through the IdP sign-out |
 | `GET`  | `/health` | Liveness check |
 
-### Traefik routing
+### Traefik routing — cross-repo invariant
 
-Every endpoint above **must** have a matching `Path()` entry in the deployment's
-`mpass-bridge` Traefik router rule. A path missing from the rule falls through to
-the oauth2-proxy catch-all, which answers with a `302` to the login page —
-machine-to-machine callers (MCP OAuth token exchange) cannot follow that, so auth
-breaks silently. Add a route here and you must update the router rule in the same
-change.
+Every endpoint above **must** have a matching `Path()` entry in the `mpass-bridge`
+Traefik router rule. A path missing from that rule falls through to the
+oauth2-proxy catch-all, which answers with a `302` to the login page —
+machine-to-machine callers (MCP OAuth token exchange) cannot follow a redirect,
+so auth breaks silently rather than erroring.
+
+The router rule does **not** live in this repository. It is the
+`traefik.http.routers.mpass-bridge.rule` label on the `mpass-auth-proxy` service
+in `docker-compose.yml` in `Pressingly/foss-server-bundle` (private), and it
+currently lists exactly the six paths in the table above.
+
+So adding, renaming or removing a route here is a **two-repo change**: land the
+route in this repo, then open a coordinated PR against foss-server-bundle
+updating the rule. The route is not reachable in any deployment until both have
+shipped. If you do not have access to that repo, say so on your PR so someone who
+does can pair the change.
 
 ## Configuration
 
