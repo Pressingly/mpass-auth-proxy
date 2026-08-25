@@ -1,0 +1,13 @@
+# Build-context hygiene only. Deliberately does NOT exclude tests/ or
+# pytest.ini so the image contents stay identical to the foss-server-bundle
+# build this repo was extracted from.
+.git/
+.gitignore
+.dockerignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
