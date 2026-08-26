@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Never commit real environment files. The negations keep the two committed
+# ones tracked: .env.example is the documented config contract, and
+# tests/.env.test is loaded by pytest.ini's env_files (the suite fails without
+# it) and holds fake values only.
+.env
+.env.*
+!.env.example
+!tests/.env.test

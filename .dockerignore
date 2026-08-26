@@ -1,0 +1,18 @@
+# Build-context hygiene. tests/ and pytest.ini are deliberately NOT excluded,
+# so the application payload stays the same as the foss-server-bundle build
+# this repo was extracted from. The image does additionally pick up README.md,
+# .env.example and LICENSE, which did not exist in the old subfolder context;
+# .git/ must be excluded because the context is now a repo root rather than a
+# subdirectory of one.
+.git/
+.gitignore
+.dockerignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
