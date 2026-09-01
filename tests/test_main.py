@@ -40,6 +40,30 @@ client = TestClient(m.app, raise_server_exceptions=True)
 
 
 @pytest.fixture(autouse=True)
+def stub_launchpad_lookup():
+    """Keep the launchpad DB out of the unit suite.
+
+    The email overlay runs on every /token path, so without this each test
+    attempts a real asyncpg.create_pool against postgres:5432 and pays a connect
+    timeout. It also fails closed now, so an unstubbed lookup would turn every
+    token test into a 503. Default: no verified row (the synthetic-email case).
+    Tests that care override it explicitly."""
+    with patch("main._lookup_real_email", new=AsyncMock(return_value=None)):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def reset_launchpad_pool_state():
+    """The pool negative-cache is module state; a failure in one test would
+    otherwise suppress retries in the next."""
+    m._launchpad_pool = None
+    m._launchpad_pool_failed_at = None
+    yield
+    m._launchpad_pool = None
+    m._launchpad_pool_failed_at = None
+
+
+@pytest.fixture(autouse=True)
 def reset_jwks_cache():
     m._jwks_cache = None
     m._jwks_fetched_at = None
@@ -693,7 +717,8 @@ class TestTokenEndpointDiscovery:
                 status_code = 200
                 text = ""
                 def json(self): return {
-                    "access_token": "x", "id_token": "y",
+                    "access_token": "x",
+                    "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
                     "token_type": "Bearer", "expires_in": 3600,
                 }
             return FakeResp()
@@ -724,13 +749,15 @@ class TestRefreshToken:
         config), its /token response omits `refresh_token`. The bridge must
         echo the original back so oauth2-proxy keeps a valid token for the
         next refresh cycle."""
+        idp_id_token = _make_jwt({"sub": "u", "iss": _ISSUER, "exp": 9_999_999_999})
+
         async def fake_post(self_inner, url, **kwargs):
             class FakeResp:
                 status_code = 200
                 text = ""
                 def json(self): return {
                     "access_token": "new.cognito.access_token",
-                    "id_token": "new.cognito.id_token",
+                    "id_token": idp_id_token,
                     "token_type": "Bearer",
                     "expires_in": 3600,
                 }
@@ -746,7 +773,9 @@ class TestRefreshToken:
         assert response.status_code == 200
         body = response.json()
         assert body["access_token"] == "new.cognito.access_token"
-        assert body["id_token"] == "new.cognito.id_token"
+        # id_token is re-signed by mpass-auth-proxy (Approach A', ADR-0007), so it
+        # differs from the IdP-issued token but preserves sub/exp.
+        assert body["id_token"] != idp_id_token
         assert body["token_type"] == "Bearer"
         assert body["expires_in"] == m.SESSION_EXPIRES_IN
         assert body["refresh_token"] == "old.refresh.token"
@@ -765,7 +794,7 @@ class TestRefreshToken:
                 text = ""
                 def json(self): return {
                     "access_token": "new.cognito.access_token",
-                    "id_token": "new.cognito.id_token",
+                    "id_token": _make_jwt({"sub": "u", "iss": _ISSUER, "exp": 9_999_999_999}),
                     "token_type": "Bearer",
                     "expires_in": 3600,
                     "refresh_token": "rotated.refresh.token",
@@ -890,6 +919,21 @@ class TestMpassLogout:
 
         assert response.status_code == 302
         assert response.headers["location"] == "/oauth2/sign_out"
+
+
+def test_jwks_endpoint_returns_valid_structure():
+    response = client.get("/.well-known/jwks.json")
+    assert response.status_code == 200
+    body = response.json()
+    assert "keys" in body
+    assert len(body["keys"]) == 1
+    key = body["keys"][0]
+    assert key["kty"] == "RSA"
+    assert key["use"] == "sig"
+    assert key["alg"] == "RS256"
+    assert "n" in key
+    assert "e" in key
+    assert "kid" in key
 
 
 _CORPORATE_ID = "corp-uuid-1234"
@@ -1041,7 +1085,8 @@ class TestRefreshTokenCorporateId:
                 status_code = 200
                 text = ""
                 def json(self_resp): return {
-                    "access_token": "new.access", "id_token": "new.id",
+                    "access_token": "new.access",
+                    "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
                     "token_type": "Bearer", "expires_in": 3600,
                 }
             return FakeResp()
@@ -1077,3 +1122,242 @@ class TestTestConstants:
         assert not hasattr(_self, "COGNITO_ISSUER"), (
             "Remove module-level COGNITO_ISSUER; use _ISSUER instead"
         )
+
+
+@pytest.mark.asyncio
+async def test_overlay_replaces_email_for_verified_user():
+    from main import _apply_email_overlay
+    claims = {"sub": "test-sid", "cognito:username": "test-sid", "email": "test-sid@synthetic.example.com"}
+    with patch("main._lookup_real_email", new=AsyncMock(return_value="real@example.com")):
+        out = await _apply_email_overlay(claims)
+    assert out["email"] == "real@example.com"
+
+
+@pytest.mark.asyncio
+async def test_overlay_sets_synthetic_email_for_unverified_user():
+    """Input carries a real-looking address deliberately: with a synthetic input
+    the assertion holds whether the code overwrites the claim or leaves it, so
+    it could not detect a regression either way."""
+    from main import _apply_email_overlay
+    claims = {"sub": "test-sid", "cognito:username": "test-sid", "email": "stale@corp.example"}
+    with patch("main._lookup_real_email", new=AsyncMock(return_value=None)):
+        out = await _apply_email_overlay(claims)
+    assert out["email"] == "test-sid@synthetic.example.com"
+
+
+@pytest.mark.asyncio
+async def test_overlay_raises_on_db_error():
+    """A lookup failure must not be reported as "no verified email".
+
+    Falling back to the synthetic address would issue a verified user a token
+    identifying them as the synthetic address for the duration of the outage,
+    and every
+    downstream app keys identity on that claim -- so the same human arrives as
+    two different principals, intermittently."""
+    from main import _apply_email_overlay, EmailOverlayUnavailable
+    claims = {"sub": "test-sid", "cognito:username": "test-sid", "email": "test-sid@synthetic.example.com"}
+    with patch("main._lookup_real_email", new=AsyncMock(side_effect=Exception("db down"))):
+        with pytest.raises(EmailOverlayUnavailable):
+            await _apply_email_overlay(claims)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_returns_503_when_overlay_unavailable(
+    monkeypatch, fake_token_endpoint
+):
+    """The 503 must reach the client rather than a downgraded identity."""
+    async def fake_post(self_inner, url, **kwargs):
+        class FakeResp:
+            status_code = 200
+            text = ""
+            def json(self_resp): return {
+                "access_token": "new.access",
+                "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
+                "token_type": "Bearer", "expires_in": 3600,
+            }
+        return FakeResp()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with patch("main._lookup_real_email", new=AsyncMock(side_effect=Exception("db down"))):
+        response = client.post(
+            "/token",
+            data={"grant_type": "refresh_token", "refresh_token": "old.refresh"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "temporarily_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_pool_failure_is_negatively_cached(monkeypatch):
+    """A down launchpad DB must cost one connect attempt per cooldown window,
+    not one per login and refresh across the whole platform."""
+    from main import EmailOverlayUnavailable
+    attempts = {"n": 0}
+
+    async def failing_create_pool(*args, **kwargs):
+        attempts["n"] += 1
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(m.asyncpg, "create_pool", failing_create_pool)
+
+    with pytest.raises(OSError):
+        await m._get_launchpad_pool()
+    assert attempts["n"] == 1
+
+    # Second call inside the cooldown must not touch the network.
+    with pytest.raises(EmailOverlayUnavailable):
+        await m._get_launchpad_pool()
+    assert attempts["n"] == 1
+
+
+def test_load_signing_key_no_env_falls_back_to_ephemeral(monkeypatch, caplog):
+    """Without GCP env vars, generates ephemeral key + warning log.
+
+    Only reachable because tests/.env.test sets
+    MPASS_SIGNING_KEY_ALLOW_EPHEMERAL=true; see the refusal test below."""
+    monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_PROJECT", raising=False)
+    monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_SECRET", raising=False)
+
+    import main
+    with caplog.at_level("WARNING"):
+        key, kid = main._load_signing_key()
+
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+    assert isinstance(key, RSAPrivateKey)
+    assert len(kid) == 32  # UUID hex
+    assert any("ephemeral" in r.message.lower() for r in caplog.records)
+    assert any("local development" in r.message.lower() for r in caplog.records)
+
+
+def test_load_signing_key_refuses_ephemeral_when_not_opted_in(monkeypatch):
+    """Without the opt-in, a missing GCP config must stop the process.
+
+    _EPHEMERAL_SIGNING_KEY_ALLOWED is read from the environment at import time,
+    so this patches the module attribute rather than the env var -- setenv here
+    would be a no-op and the test would pass without exercising anything."""
+    monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_PROJECT", raising=False)
+    monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_SECRET", raising=False)
+
+    import main
+    monkeypatch.setattr(main, "_EPHEMERAL_SIGNING_KEY_ALLOWED", False)
+    with pytest.raises(RuntimeError, match="ephemeral RSA signing key"):
+        main._load_signing_key()
+
+
+def test_load_signing_key_refuses_when_gcp_load_fails(monkeypatch):
+    """A configured-but-unreachable Secret Manager must also stop the process.
+
+    Previously this path logged a warning and silently degraded to an ephemeral
+    key, which is the same platform-wide forced re-login as having no config at
+    all -- only harder to notice, because the vars look correctly set."""
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+
+    import main
+    monkeypatch.setattr(main, "_EPHEMERAL_SIGNING_KEY_ALLOWED", False)
+
+    import sys, types
+    fake_sm = types.ModuleType("google.cloud.secretmanager")
+    def _boom(*a, **k):
+        raise RuntimeError("secret manager unreachable")
+    fake_sm.SecretManagerServiceClient = _boom
+    monkeypatch.setitem(sys.modules, "google.cloud.secretmanager", fake_sm)
+
+    with pytest.raises(RuntimeError, match="ephemeral RSA signing key"):
+        main._load_signing_key()
+
+
+def test_load_signing_key_with_gcp_loads_from_secret_manager(monkeypatch, caplog):
+    """With GCP env vars + valid secret, loads key from Secret Manager."""
+    from unittest.mock import patch, MagicMock
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    test_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    test_pem = test_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+
+    mock_response = MagicMock()
+    mock_response.payload.data = test_pem
+    mock_client = MagicMock()
+    mock_client.access_secret_version.return_value = mock_response
+
+    with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=mock_client):
+        import main
+        with caplog.at_level("INFO"):
+            key, kid = main._load_signing_key()
+
+    test_pub_der = test_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    loaded_pub_der = key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    assert test_pub_der == loaded_pub_der
+    assert len(kid) == 32
+    assert any("GCP Secret Manager" in r.message for r in caplog.records)
+
+
+def test_load_signing_key_with_gcp_falls_back_on_error(monkeypatch, caplog):
+    """With GCP env vars but Secret Manager fetch failing, falls back + warns."""
+    from unittest.mock import patch, MagicMock
+
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+    monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+
+    mock_client = MagicMock()
+    mock_client.access_secret_version.side_effect = Exception("permission denied")
+
+    with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=mock_client):
+        import main
+        with caplog.at_level("WARNING"):
+            key, kid = main._load_signing_key()
+
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+    assert isinstance(key, RSAPrivateKey)
+    assert any("Failed to load" in r.message for r in caplog.records)
+    assert any("permission denied" in r.message.lower() for r in caplog.records)
+
+
+def test_resign_id_token_produces_token_verifiable_with_jwks():
+    """Re-signed token must verify against our own JWKS."""
+    import jwt as _jwt
+    from main import _resign_id_token, _jwks_document, _SIGNING_KID
+
+    original_claims = {
+        "sub": "test-user-123",
+        "cognito:username": "test-user-123",
+        "email": "test-user-123@synthetic.example.com",
+        "aud": "test-client",
+        "iss": "https://cognito.example/abc",
+        "exp": 9999999999,
+        "iat": 1000000000,
+    }
+    new_token = _resign_id_token(original_claims)
+    # Verify the new token against OUR JWKS (Approach A')
+    jwks = _jwks_document()
+    key = _jwt.PyJWK.from_dict(jwks["keys"][0])
+    decoded = _jwt.decode(
+        new_token,
+        key.key,
+        algorithms=["RS256"],
+        audience="test-client",
+        issuer="http://mpass-auth-proxy:8000",
+    )
+    # Original sub/email preserved; iss replaced with ours
+    assert decoded["sub"] == "test-user-123"
+    assert decoded["email"] == "test-user-123@synthetic.example.com"
+    assert decoded["iss"] == "http://mpass-auth-proxy:8000"
+    # kid header matches our JWKS
+    header = _jwt.get_unverified_header(new_token)
+    assert header["kid"] == _SIGNING_KID
