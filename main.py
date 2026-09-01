@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import base64
 import json
@@ -9,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 from urllib.parse import quote, urlencode, urlparse
 
+import asyncpg
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI
@@ -17,6 +19,9 @@ import jwt
 from jwt import PyJWK
 from jwt.exceptions import InvalidTokenError
 from starlette.requests import Request
+import uuid as _uuid
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 
 # Configure the root logger. uvicorn's --log-level only configures uvicorn's own
 # loggers ("uvicorn", "uvicorn.error", "uvicorn.access"); this module's logger
@@ -132,6 +137,309 @@ PORTAL_URL: str = _derive_portal_url()
 
 app = FastAPI(docs_url=None, redoc_url=None)
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+# ---------------------------------------------------------------------------
+# RSA signing key (Approach A' — see ADR-0007)
+# Loaded from GCP Secret Manager when MPASS_SIGNING_KEY_GCP_PROJECT and
+# MPASS_SIGNING_KEY_GCP_SECRET are set; otherwise generated ephemerally
+# in-memory (dev only — all issued tokens become invalid on restart, and
+# horizontal scaling is not supported in this mode). See dev/docs/deploy-
+# signing-key.md for the deployment runbook.
+# ---------------------------------------------------------------------------
+
+
+# Ephemeral keys are a local-development affordance only. Guarding on an opt-in
+# rather than on an environment name means a deploy that forgets the GCP vars
+# stops at startup instead of silently degrading, which is the failure this
+# guard exists to prevent -- an env-name check would pass on any host whose
+# ENVIRONMENT var was also unset.
+_EPHEMERAL_SIGNING_KEY_ALLOWED: bool = (
+    os.environ.get("MPASS_SIGNING_KEY_ALLOW_EPHEMERAL", "false").strip().lower()
+    in {"1", "true", "yes"}
+)
+
+
+def _public_key_fingerprint(public_key) -> str:
+    """SHA-256 fingerprint of the public key's DER bytes, hex-encoded.
+    Deterministic — the same key always yields the same kid."""
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()[:32]
+
+
+def _load_signing_key():
+    """Load the RSA signing key from GCP Secret Manager if configured;
+    otherwise generate ephemeral in-memory (dev-only).
+
+    Env vars (both required for GCP path):
+      MPASS_SIGNING_KEY_GCP_PROJECT  — GCP project id
+      MPASS_SIGNING_KEY_GCP_SECRET   — secret resource name (e.g. mpass-signing-key)
+
+    Returns: (private_key, kid)
+    """
+    project_id = os.environ.get("MPASS_SIGNING_KEY_GCP_PROJECT", "").strip()
+    secret_name = os.environ.get("MPASS_SIGNING_KEY_GCP_SECRET", "").strip()
+
+    if project_id and secret_name:
+        try:
+            from google.cloud import secretmanager
+            client = secretmanager.SecretManagerServiceClient()
+            resource = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            response = client.access_secret_version(request={"name": resource})
+            private_key = serialization.load_pem_private_key(
+                response.payload.data, password=None
+            )
+            kid = _public_key_fingerprint(private_key.public_key())
+            logger.info(
+                "Loaded RSA signing key from GCP Secret Manager (project=%s, secret=%s, kid=%s)",
+                project_id, secret_name, kid,
+            )
+            return private_key, kid
+        except Exception as exc:
+            if _EPHEMERAL_SIGNING_KEY_ALLOWED:
+                logger.warning(
+                    "Failed to load signing key from GCP Secret Manager "
+                    "(project=%s, secret=%s): %s — falling back to ephemeral "
+                    "in-memory key because MPASS_SIGNING_KEY_ALLOW_EPHEMERAL is "
+                    "set. Sessions will be invalidated on next restart. "
+                    "DO NOT run this configuration in staging or production.",
+                    project_id, secret_name, exc,
+                )
+            else:
+                logger.error(
+                    "Failed to load signing key from GCP Secret Manager "
+                    "(project=%s, secret=%s): %s — refusing to start.",
+                    project_id, secret_name, exc,
+                )
+    else:
+        logger.warning(
+            "MPASS_SIGNING_KEY_GCP_PROJECT / MPASS_SIGNING_KEY_GCP_SECRET not "
+            "configured; generating ephemeral in-memory RSA signing key. All "
+            "issued tokens will become invalid on the next restart, and "
+            "horizontal scaling is not supported in this mode. This is for "
+            "local development only."
+        )
+
+    if not _EPHEMERAL_SIGNING_KEY_ALLOWED:
+        raise RuntimeError(
+            "Refusing to start with an ephemeral RSA signing key. "
+            "oauth2-proxy verifies every id_token against this service's JWKS, "
+            "so a per-process uuid4 kid means every restart forces a re-login "
+            "across the whole platform and no second replica can verify the "
+            "first's tokens. Set MPASS_SIGNING_KEY_GCP_PROJECT and "
+            "MPASS_SIGNING_KEY_GCP_SECRET (see dev/docs/deploy-signing-key.md), "
+            "or set MPASS_SIGNING_KEY_ALLOW_EPHEMERAL=true for local development."
+        )
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    kid = _uuid.uuid4().hex
+    return private_key, kid
+
+
+_SIGNING_PRIVATE_KEY, _SIGNING_KID = _load_signing_key()
+
+def _jwks_document() -> dict:
+    """Public-key JWKS document for oauth2-proxy to verify our re-signed tokens."""
+    public_numbers = _SIGNING_PRIVATE_KEY.public_key().public_numbers()
+    def _b64url_uint(n: int) -> str:
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    return {
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": _SIGNING_KID,
+            "n": _b64url_uint(public_numbers.n),
+            "e": _b64url_uint(public_numbers.e),
+        }]
+    }
+
+
+MPASS_PROXY_ISSUER_URL: str = os.environ.get(
+    "MPASS_PROXY_ISSUER_URL", "http://mpass-auth-proxy:8000"
+)
+
+
+def _resign_id_token(claims: dict) -> str:
+    """Re-sign an id_token's claims with our RSA key. Replaces iss with our URL.
+    Preserves all other claims (sub, aud, email, exp, iat, cognito:username, etc.)."""
+    new_claims = dict(claims)
+    new_claims["iss"] = MPASS_PROXY_ISSUER_URL
+    return jwt.encode(
+        new_claims,
+        _SIGNING_PRIVATE_KEY,
+        algorithm="RS256",
+        headers={"kid": _SIGNING_KID},
+    )
+
+
+def _decode_id_token_claims_unsafe(id_token: str) -> dict | None:
+    """Extract claims from a Cognito-signed id_token without re-verifying.
+
+    Skipping signature verification here is intentional and safe at both call
+    sites, because the token's provenance is already trusted:
+      - callback path: the signature was verified in `_bridge_callback_impl`
+        before the token was stored in Redis;
+      - refresh path: the token is a fresh server-to-server response read
+        directly from Cognito's token endpoint over TLS.
+    We only need the payload to apply the email overlay and re-sign it."""
+    try:
+        return jwt.decode(id_token, options={"verify_signature": False})
+    except InvalidTokenError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Synthetic email domain. Read from config rather than hardcoded so this
+# service and the platform agree on one value: the bundle passes
+# ${DEFAULT_EMAIL_DOMAIN}, which is also what the apps and the admin
+# provisioning script use.
+#
+# Unset is fatal rather than defaulted. A wrong or changed value here does not
+# degrade the service, it silently re-keys identity: downstream apps provision
+# on the email claim, so every user would arrive as a brand-new principal and
+# their existing workspaces, documents and issues would be orphaned. That is
+# not something to let a missing environment variable decide.
+_SYNTHETIC_EMAIL_DOMAIN: str = os.environ.get("SYNTHETIC_EMAIL_DOMAIN", "").strip()
+if not _SYNTHETIC_EMAIL_DOMAIN:
+    raise RuntimeError(
+        "SYNTHETIC_EMAIL_DOMAIN is required. It forms the synthetic address "
+        "(<synthetic_id>@<domain>) that unverified users are identified by, and "
+        "every downstream app keys identity on that claim -- so defaulting it "
+        "would silently re-key every user. Set it to the platform's "
+        "DEFAULT_EMAIL_DOMAIN."
+    )
+
+
+# Launchpad DB — email overlay (Approach A' — see ADR-0007)
+# Looks up the real, verified email for a synthetic <sid>@<domain> claim so
+# downstream apps see the real address. DB failure must never break login.
+# ---------------------------------------------------------------------------
+
+_LAUNCHPAD_DSN: str = (
+    f"postgresql://{os.environ.get('LAUNCHPAD_DB_USER', 'mpass_auth_user')}:"
+    f"{os.environ.get('LAUNCHPAD_DB_PASSWORD', '')}@"
+    f"{os.environ.get('LAUNCHPAD_DB_HOST', 'postgres')}:"
+    f"{os.environ.get('LAUNCHPAD_DB_PORT', '5432')}/"
+    f"{os.environ.get('LAUNCHPAD_DB_NAME', 'launchpad')}"
+)
+_launchpad_pool: asyncpg.Pool | None = None
+
+# Negative cache for pool construction. The overlay runs on every /token call,
+# so without this a missing or unreachable launchpad database means a fresh
+# create_pool attempt -- and a full connect timeout -- on every login and every
+# refresh, platform-wide. One attempt per cooldown window instead.
+_LAUNCHPAD_POOL_RETRY_COOLDOWN = timedelta(seconds=30)
+_launchpad_pool_failed_at: datetime | None = None
+_launchpad_pool_lock = asyncio.Lock()
+
+
+class EmailOverlayUnavailable(Exception):
+    """The launchpad lookup could not be completed.
+
+    Distinct from "this user has no verified email", which is an answer. This
+    means we do not know, and callers must fail the request rather than issue a
+    token carrying the synthetic address -- downstream apps key identity on that
+    address, so guessing makes one human arrive as two different principals.
+    """
+
+
+async def _get_launchpad_pool() -> asyncpg.Pool:
+    global _launchpad_pool, _launchpad_pool_failed_at
+    if _launchpad_pool is not None:
+        return _launchpad_pool
+
+    # Serialised so a login storm after a restart constructs one pool rather
+    # than one per concurrent request, each holding up to max_size connections
+    # against a Postgres shared with every other app.
+    async with _launchpad_pool_lock:
+        if _launchpad_pool is not None:
+            return _launchpad_pool
+
+        if _launchpad_pool_failed_at is not None:
+            since = datetime.now(UTC) - _launchpad_pool_failed_at
+            if since < _LAUNCHPAD_POOL_RETRY_COOLDOWN:
+                raise EmailOverlayUnavailable(
+                    f"launchpad pool unavailable; retry suppressed for another "
+                    f"{(_LAUNCHPAD_POOL_RETRY_COOLDOWN - since).total_seconds():.0f}s"
+                )
+
+        try:
+            _launchpad_pool = await asyncpg.create_pool(
+                dsn=_LAUNCHPAD_DSN, min_size=1, max_size=5, command_timeout=5,
+            )
+        except Exception as exc:
+            _launchpad_pool_failed_at = datetime.now(UTC)
+            # ERROR, not warning, and once per cooldown window rather than per
+            # request: while this is failing every /token exchange and every
+            # session refresh returns 503 platform-wide, and /health cannot see
+            # it -- it is a static 200 that touches neither the pool nor the IdP.
+            logger.error(
+                "launchpad pool unavailable — ALL token exchanges and session "
+                "refreshes will return 503 until this recovers. %s: %s",
+                type(exc).__name__, exc,
+            )
+            raise
+        _launchpad_pool_failed_at = None
+        return _launchpad_pool
+
+
+async def _lookup_real_email(synthetic_id: str) -> str | None:
+    """Return the real email for a verified user, or None if there is no
+    verified row. Raises on any failure to reach the database — see
+    EmailOverlayUnavailable."""
+    pool = await _get_launchpad_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT real_email FROM foss_users "
+            "WHERE synthetic_id = $1 AND verified = TRUE",
+            synthetic_id,
+        )
+    return row["real_email"] if row else None
+
+
+async def _apply_email_overlay(claims: dict) -> dict:
+    """Normalize the email claim to either a verified real email or the
+    synthetic `<sid>@<SYNTHETIC_EMAIL_DOMAIN>`. Cognito's `email` claim is the
+    literal string
+    `cognito:default_val` for synthetic users — useless downstream — so we
+    always replace it. Also stamps `preferred_username` with the synthetic_id
+    so apps can recover the stable identifier even when email is real.
+
+    Raises EmailOverlayUnavailable when the lookup cannot be completed. It is
+    tempting to swallow that and fall back to the synthetic address, but a
+    verified user would then be issued a token identifying them as
+    the synthetic address for the duration of the outage, and every app keys
+    identity
+    on that claim -- so a one-second database hiccup silently turns one human
+    into two principals, intermittently. A 503 is recoverable; a split identity
+    is not."""
+    synthetic_id = claims.get("cognito:username") or claims.get("sub")
+    if not synthetic_id:
+        return claims
+    try:
+        real_email = await _lookup_real_email(synthetic_id)
+    except EmailOverlayUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "foss_users lookup failed for sid=%s: %s: %s",
+            synthetic_id, type(exc).__name__, exc,
+        )
+        raise EmailOverlayUnavailable(str(exc)) from exc
+    new_claims = dict(claims)
+    new_claims["preferred_username"] = synthetic_id
+    if real_email:
+        new_claims["email"] = real_email
+        logger.info("overlay: applied real_email for sid=%s", synthetic_id)
+    else:
+        new_claims["email"] = f"{synthetic_id}@{_SYNTHETIC_EMAIL_DOMAIN}"
+        logger.info("overlay: set synthetic email for sid=%s", synthetic_id)
+    return new_claims
+
 
 # ---------------------------------------------------------------------------
 # JWKS cache
@@ -284,6 +592,11 @@ def _moneta_login_url() -> str:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/.well-known/jwks.json")
+async def jwks() -> dict:
+    return _jwks_document()
 
 
 @app.get("/mpass/login")
@@ -495,9 +808,19 @@ async def _handle_authorization_code(code: str, code_verifier: str) -> Response:
         )
         return _token_error("invalid_grant", "PKCE verification failed")
 
+    original_claims = _decode_id_token_claims_unsafe(code_data["id_token"])
+    if original_claims is None:
+        return Response(status_code=500, content="Corrupt id_token in code data")
+    try:
+        original_claims = await _apply_email_overlay(original_claims)
+    except EmailOverlayUnavailable as exc:
+        logger.error("bridge_token: email overlay unavailable: %s", exc)
+        return _token_error("temporarily_unavailable", "Email overlay unavailable", status_code=503)
+    resigned_id_token = _resign_id_token(original_claims)
+
     body: dict = {
         "access_token": code_data["access_token"],
-        "id_token": code_data["id_token"],
+        "id_token": resigned_id_token,
         "token_type": "Bearer",
         "expires_in": SESSION_EXPIRES_IN,
     }
@@ -551,6 +874,7 @@ async def _handle_refresh_token(refresh_token: str) -> Response:
         )
         return Response(status_code=502, content="Incomplete response from token endpoint")
 
+    # Corporate-id gate (from main): reject early before we re-sign anything.
     try:
         await _validate_corporate_id(token_body["access_token"])
     except CorporateIdMismatch as exc:
@@ -562,9 +886,24 @@ async def _handle_refresh_token(refresh_token: str) -> Response:
             media_type="application/json",
         )
 
+    # Forward Cognito's refresh_token if it issued a new one (rotation enabled);
+    # fall back to the original if it didn't (rotation disabled). oauth2-proxy
+    # needs *some* refresh_token in the response either way. The previous
+    # unconditional echo silently negated refresh-token rotation if it was ever
+    # enabled at the Cognito App Client level.
+    original_claims = _decode_id_token_claims_unsafe(token_body["id_token"])
+    if original_claims is None:
+        return Response(status_code=502, content="Corrupt id_token from IdP")
+    try:
+        original_claims = await _apply_email_overlay(original_claims)
+    except EmailOverlayUnavailable as exc:
+        logger.error("bridge_token refresh: email overlay unavailable: %s", exc)
+        return _token_error("temporarily_unavailable", "Email overlay unavailable", status_code=503)
+    resigned_id_token = _resign_id_token(original_claims)
+
     body: dict = {
         "access_token": token_body["access_token"],
-        "id_token": token_body["id_token"],
+        "id_token": resigned_id_token,
         "token_type": "Bearer",
         "expires_in": SESSION_EXPIRES_IN,
         "refresh_token": token_body.get("refresh_token") or refresh_token,

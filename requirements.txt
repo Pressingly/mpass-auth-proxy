@@ -4,3 +4,5 @@ httpx==0.28.1
 redis[hiredis]==5.2.1
 PyJWT[crypto]==2.9.0
 python-multipart==0.0.20
+asyncpg==0.30.0
+google-cloud-secret-manager==2.20.2
