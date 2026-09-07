@@ -13,7 +13,7 @@ from urllib.parse import quote, urlencode, urlparse
 import asyncpg
 import httpx
 import redis.asyncio as aioredis
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse, Response
 import jwt
 from jwt import PyJWK
@@ -148,6 +148,28 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Launchpad email capture — feature flag
+# ---------------------------------------------------------------------------
+# Off by default so this branch is inert on merge. Four things move together and
+# MUST NOT be separated:
+#
+#   1. oauth2-proxy's OIDC_ISSUER_URL / OIDC_JWKS_URL (Cognito vs this service)
+#   2. whether this service re-signs the id_token or echoes the IdP's
+#   3. whether the email overlay runs at all
+#   4. whether launchpad-api is deployed
+#
+# (1) and (2) are the dangerous pair: oauth2-proxy verifies every id_token
+# against whichever JWKS it is pointed at, so re-signing while it still trusts
+# Cognito -- or echoing Cognito's token while it trusts us -- means no token
+# verifies and nobody can log in to anything. They are driven from this one flag
+# for that reason. See docker-compose.yml's oauth2-proxy block.
+_EMAIL_CAPTURE_ENABLED: bool = (
+    os.environ.get("LAUNCHPAD_EMAIL_CAPTURE", "false").strip().lower()
+    in {"1", "true", "yes"}
+)
+
+
 # Ephemeral keys are a local-development affordance only. Guarding on an opt-in
 # rather than on an environment name means a deploy that forgets the GCP vars
 # stops at startup instead of silently degrading, which is the failure this
@@ -238,7 +260,14 @@ def _load_signing_key():
     return private_key, kid
 
 
-_SIGNING_PRIVATE_KEY, _SIGNING_KID = _load_signing_key()
+# Only load a signing key when we are actually the signer. With the feature off
+# oauth2-proxy verifies against the IdP directly and this service never signs
+# anything, so requiring a GCP secret would be a deployment burden for a code
+# path that does not run.
+if _EMAIL_CAPTURE_ENABLED:
+    _SIGNING_PRIVATE_KEY, _SIGNING_KID = _load_signing_key()
+else:
+    _SIGNING_PRIVATE_KEY, _SIGNING_KID = None, None
 
 def _jwks_document() -> dict:
     """Public-key JWKS document for oauth2-proxy to verify our re-signed tokens."""
@@ -261,6 +290,27 @@ def _jwks_document() -> dict:
 MPASS_PROXY_ISSUER_URL: str = os.environ.get(
     "MPASS_PROXY_ISSUER_URL", "http://mpass-auth-proxy:8000"
 )
+
+
+async def _issue_id_token(idp_id_token: str) -> str:
+    """The id_token to hand back to oauth2-proxy.
+
+    With email capture off this is the IdP's token, byte for byte, and
+    oauth2-proxy verifies it against the IdP's JWKS. With it on we overlay the
+    verified email and re-sign, and oauth2-proxy verifies against ours instead.
+
+    Both halves are driven by the same flag on purpose: signing with one key
+    while oauth2-proxy trusts another means no token verifies and nobody can log
+    in to any application. Raises EmailOverlayUnavailable, which callers turn
+    into a 503."""
+    if not _EMAIL_CAPTURE_ENABLED:
+        return idp_id_token
+
+    claims = _decode_id_token_claims_unsafe(idp_id_token)
+    if claims is None:
+        raise ValueError("Corrupt id_token")
+    claims = await _apply_email_overlay(claims)
+    return _resign_id_token(claims)
 
 
 def _resign_id_token(claims: dict) -> str:
@@ -303,8 +353,21 @@ def _decode_id_token_claims_unsafe(id_token: str) -> dict | None:
 # on the email claim, so every user would arrive as a brand-new principal and
 # their existing workspaces, documents and issues would be orphaned. That is
 # not something to let a missing environment variable decide.
+if _EMAIL_CAPTURE_ENABLED and not os.environ.get("LAUNCHPAD_DB_PASSWORD", "").strip():
+    # Compose cannot make a required-variable guard conditional -- it
+    # interpolates every service regardless of profiles -- so the check lives
+    # here. An empty password does not degrade the overlay, it makes every
+    # lookup fail, and since the overlay fails closed that is a 503 on every
+    # token exchange platform-wide.
+    raise RuntimeError(
+        "LAUNCHPAD_EMAIL_CAPTURE is on but LAUNCHPAD_DB_PASSWORD is empty. "
+        "Set LAUNCHPAD_MPASS_DB_PASSWORD in .env (platform.sh generates it on a "
+        "fresh install; existing deployments must add it by hand -- see "
+        "dev/docs/launchpad-runbook.md)."
+    )
+
 _SYNTHETIC_EMAIL_DOMAIN: str = os.environ.get("SYNTHETIC_EMAIL_DOMAIN", "").strip()
-if not _SYNTHETIC_EMAIL_DOMAIN:
+if _EMAIL_CAPTURE_ENABLED and not _SYNTHETIC_EMAIL_DOMAIN:
     raise RuntimeError(
         "SYNTHETIC_EMAIL_DOMAIN is required. It forms the synthetic address "
         "(<synthetic_id>@<domain>) that unverified users are identified by, and "
@@ -596,6 +659,18 @@ async def health():
 
 @app.get("/.well-known/jwks.json")
 async def jwks() -> dict:
+    # With email capture off this service does not sign anything -- oauth2-proxy
+    # is pointed at the IdP's JWKS instead. Serving an empty or invented key set
+    # here would be worse than 404: a misconfigured oauth2-proxy pointed at us
+    # would fail verification with no indication why.
+    if not _EMAIL_CAPTURE_ENABLED:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "mpass-auth-proxy is not the token signer: LAUNCHPAD_EMAIL_CAPTURE "
+                "is off, so oauth2-proxy must verify against the IdP's JWKS."
+            ),
+        )
     return _jwks_document()
 
 
@@ -808,19 +883,17 @@ async def _handle_authorization_code(code: str, code_verifier: str) -> Response:
         )
         return _token_error("invalid_grant", "PKCE verification failed")
 
-    original_claims = _decode_id_token_claims_unsafe(code_data["id_token"])
-    if original_claims is None:
-        return Response(status_code=500, content="Corrupt id_token in code data")
     try:
-        original_claims = await _apply_email_overlay(original_claims)
+        issued_id_token = await _issue_id_token(code_data["id_token"])
     except EmailOverlayUnavailable as exc:
         logger.error("bridge_token: email overlay unavailable: %s", exc)
         return _token_error("temporarily_unavailable", "Email overlay unavailable", status_code=503)
-    resigned_id_token = _resign_id_token(original_claims)
+    except ValueError:
+        return Response(status_code=500, content="Corrupt id_token in code data")
 
     body: dict = {
         "access_token": code_data["access_token"],
-        "id_token": resigned_id_token,
+        "id_token": issued_id_token,
         "token_type": "Bearer",
         "expires_in": SESSION_EXPIRES_IN,
     }
@@ -891,19 +964,17 @@ async def _handle_refresh_token(refresh_token: str) -> Response:
     # needs *some* refresh_token in the response either way. The previous
     # unconditional echo silently negated refresh-token rotation if it was ever
     # enabled at the Cognito App Client level.
-    original_claims = _decode_id_token_claims_unsafe(token_body["id_token"])
-    if original_claims is None:
-        return Response(status_code=502, content="Corrupt id_token from IdP")
     try:
-        original_claims = await _apply_email_overlay(original_claims)
+        issued_id_token = await _issue_id_token(token_body["id_token"])
     except EmailOverlayUnavailable as exc:
         logger.error("bridge_token refresh: email overlay unavailable: %s", exc)
         return _token_error("temporarily_unavailable", "Email overlay unavailable", status_code=503)
-    resigned_id_token = _resign_id_token(original_claims)
+    except ValueError:
+        return Response(status_code=502, content="Corrupt id_token from IdP")
 
     body: dict = {
         "access_token": token_body["access_token"],
-        "id_token": resigned_id_token,
+        "id_token": issued_id_token,
         "token_type": "Bearer",
         "expires_in": SESSION_EXPIRES_IN,
         "refresh_token": token_body.get("refresh_token") or refresh_token,

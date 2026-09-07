@@ -2,6 +2,7 @@ import hashlib
 import importlib
 import base64 as _b64
 import json
+import subprocess
 import logging
 import os
 import sys
@@ -539,6 +540,30 @@ class TestBridgeToken:
             "refresh_token": refresh_token,
             "code_challenge": challenge,
         })
+
+    def test_authorization_code_returns_503_when_overlay_unavailable(
+        self, fake_redis, fake_token_endpoint
+    ):
+        """The first-login path, not just refresh.
+
+        This is the branch that fails first in a launchpad outage: a user who
+        has never logged in cannot, where a refreshing user at least had a
+        working session moments ago. It had no coverage at all."""
+        self._seed_bridge_code(fake_redis)
+
+        with patch("main._lookup_real_email",
+                   new=AsyncMock(side_effect=Exception("db down"))):
+            response = client.post(
+                "/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": "test-code-uuid",
+                    "code_verifier": _TEST_PKCE_VERIFIER,
+                },
+            )
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "temporarily_unavailable"
 
     def test_unsupported_grant_type_returns_400(self, fake_redis):
         response = client.post(
@@ -1361,3 +1386,111 @@ def test_resign_id_token_produces_token_verifiable_with_jwks():
     # kid header matches our JWKS
     header = _jwt.get_unverified_header(new_token)
     assert header["kid"] == _SIGNING_KID
+
+
+class TestEmailCaptureDisabled:
+    """The off state is the whole point of the flag: this branch must be inert
+    on merge. _EMAIL_CAPTURE_ENABLED is read at import, so these patch the
+    module attribute rather than the environment."""
+
+    @pytest.mark.asyncio
+    async def test_issue_id_token_echoes_idp_token_unchanged(self):
+        """No overlay, no re-signing -- byte-for-byte what the IdP issued.
+
+        oauth2-proxy is pointed at the IdP's JWKS when the flag is off, so
+        anything other than a verbatim echo fails verification for every user."""
+        idp_token = _make_jwt({"sub": "u", "email": "real@corp.example",
+                               "exp": 9_999_999_999})
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False):
+            out = await m._issue_id_token(idp_token)
+        assert out == idp_token
+
+    @pytest.mark.asyncio
+    async def test_disabled_path_never_touches_the_launchpad_database(self):
+        """A launchpad DB that does not exist yet must not affect logins."""
+        lookup = AsyncMock(side_effect=AssertionError("must not be called"))
+        idp_token = _make_jwt({"sub": "u", "exp": 9_999_999_999})
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False), \
+             patch("main._lookup_real_email", new=lookup):
+            out = await m._issue_id_token(idp_token)
+        assert out == idp_token
+        lookup.assert_not_awaited()
+
+    def test_jwks_endpoint_404s_when_disabled(self):
+        """Serving a key set while oauth2-proxy trusts the IdP would be worse
+        than 404: verification would fail with no indication why."""
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False):
+            response = client.get("/.well-known/jwks.json")
+        assert response.status_code == 404
+        assert "not the token signer" in response.json()["detail"]
+
+    def test_jwks_endpoint_serves_a_key_when_enabled(self):
+        response = client.get("/.well-known/jwks.json")
+        assert response.status_code == 200
+        assert len(response.json()["keys"]) == 1
+
+
+class TestEmailCaptureImportTime:
+    """The flag is read at import, and the other tests patch it afterwards --
+    so nothing in this file otherwise covers what happens at import. These run
+    a real subprocess because that is the only way to exercise it."""
+
+    _BASE_ENV = {
+        "OIDC_ISSUER_URL": "https://idp.example.com/pool",
+        "OIDC_CLIENT_ID": "test-client-id",
+        "MONETA_HOSTED_UI_URL": "https://ui.example.com",
+        "MPASS_CALLBACK_URL": "https://auth.example.com/mpass-callback",
+        "REDIS_URL": "redis://localhost:6379/0",
+        "COOKIE_DOMAIN": ".example.com",
+    }
+
+    def _import_with(self, **overrides) -> subprocess.CompletedProcess:
+        env = {"PATH": os.environ["PATH"], **self._BASE_ENV, **overrides}
+        return subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env, capture_output=True, text=True,
+        )
+
+    def test_disabled_imports_with_nothing_configured(self):
+        """The inert state must not need a signing key, a synthetic domain or a
+        database password. If it did, merging this branch would require every
+        deployment to configure a feature it is not running."""
+        result = self._import_with(LAUNCHPAD_EMAIL_CAPTURE="false")
+        assert result.returncode == 0, result.stderr
+
+    def test_enabled_without_signing_key_refuses_to_start(self):
+        result = self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="true",
+            SYNTHETIC_EMAIL_DOMAIN="synthetic.example.com",
+            LAUNCHPAD_DB_PASSWORD="pw",
+        )
+        assert result.returncode != 0
+        assert "ephemeral RSA signing key" in result.stderr
+
+    def test_enabled_without_db_password_refuses_to_start(self):
+        result = self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="true",
+            SYNTHETIC_EMAIL_DOMAIN="synthetic.example.com",
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode != 0
+        assert "LAUNCHPAD_DB_PASSWORD is empty" in result.stderr
+
+    def test_enabled_without_synthetic_domain_refuses_to_start(self):
+        result = self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="true",
+            LAUNCHPAD_DB_PASSWORD="pw",
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode != 0
+        assert "SYNTHETIC_EMAIL_DOMAIN is required" in result.stderr
+
+    def test_enabled_fully_configured_imports(self):
+        result = self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="true",
+            SYNTHETIC_EMAIL_DOMAIN="synthetic.example.com",
+            LAUNCHPAD_DB_PASSWORD="pw",
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode == 0, result.stderr
