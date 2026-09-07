@@ -191,16 +191,99 @@ def _public_key_fingerprint(public_key) -> str:
     return hashlib.sha256(der).hexdigest()[:32]
 
 
-def _load_signing_key():
-    """Load the RSA signing key from GCP Secret Manager if configured;
-    otherwise generate ephemeral in-memory (dev-only).
+def _decode_signing_key_b64(value: str):
+    """Decode MPASS_SIGNING_KEY_B64 into an RSA private key, or raise.
 
-    Env vars (both required for GCP path):
-      MPASS_SIGNING_KEY_GCP_PROJECT  — GCP project id
-      MPASS_SIGNING_KEY_GCP_SECRET   — secret resource name (e.g. mpass-signing-key)
+    `value` is base64 (single line) of an unencrypted PEM private key. Base64
+    rather than raw PEM because ~10 scripts in this repo do `set -a; source
+    .env`, and a multi-line value breaks all of them.
+
+    Fail closed. Every failure here raises: a value that is present but corrupt
+    is a configuration error to surface, never a reason to fall through to GCP
+    or to an ephemeral key -- not even when MPASS_SIGNING_KEY_ALLOW_EPHEMERAL is
+    set. Note this is deliberately stricter than the GCP branch below, which
+    does still fall back to ephemeral under that opt-in; the asymmetry is
+    intentional in this change, and tightening the GCP branch to match is a
+    separate one. Do not "fix" the difference by loosening this side.
+
+    The value never appears in a message or a chained traceback (`from None`) --
+    it is the platform's identity signing key.
+    """
+    try:
+        pem = base64.b64decode(value, validate=True)
+    except Exception:
+        raise RuntimeError(
+            "MPASS_SIGNING_KEY_B64 is not valid base64 — refusing to start. "
+            "Expected a single-line base64 encoding of an unencrypted PEM RSA "
+            "private key, e.g. `openssl genpkey -algorithm RSA -pkeyopt "
+            "rsa_keygen_bits:2048 | base64 | tr -d '\\n'`. The value is not "
+            "shown here because it is a private key."
+        ) from None
+
+    try:
+        private_key = serialization.load_pem_private_key(pem, password=None)
+    except Exception:
+        raise RuntimeError(
+            "MPASS_SIGNING_KEY_B64 decoded, but the result is not a readable "
+            "unencrypted PEM private key — refusing to start. Encrypted "
+            "(passphrase-protected) keys are not supported. The decoded value "
+            "is not shown here because it is a private key."
+        ) from None
+
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        # An EC or Ed25519 PEM loads fine above and _public_key_fingerprint
+        # works on any key type, so without this check startup would succeed and
+        # log a plausible kid -- and then _jwks_document()'s .public_numbers().n
+        # would raise on the first JWKS fetch. oauth2-proxy gets a 500, nobody
+        # can log in to anything, and the service still looks healthy.
+        raise RuntimeError(
+            "MPASS_SIGNING_KEY_B64 holds a "
+            f"{type(private_key).__name__} private key, but this service signs "
+            "id_tokens with RS256 and publishes an RSA JWKS — refusing to "
+            "start. Generate an RSA key of at least 2048 bits."
+        )
+
+    if private_key.key_size < 2048:
+        raise RuntimeError(
+            f"MPASS_SIGNING_KEY_B64 holds a {private_key.key_size}-bit RSA key; "
+            "at least 2048 bits are required — refusing to start."
+        )
+
+    return private_key
+
+
+def _load_signing_key():
+    """Load the RSA signing key. Called only when _EMAIL_CAPTURE_ENABLED.
+
+    Precedence:
+      1. MPASS_SIGNING_KEY_B64 non-empty          -> use it
+      2. else GCP project AND secret non-empty    -> GCP Secret Manager
+      3. else MPASS_SIGNING_KEY_ALLOW_EPHEMERAL   -> generate in memory (dev only)
+      4. else                                     -> refuse to start
+
+    "Non-empty after .strip()" is the test throughout, not presence in the
+    environment: docker-compose.yml passes `${MPASS_SIGNING_KEY_B64:-}`, so the
+    variable is *always* in the container environment and empty when
+    unconfigured. A `in os.environ` check would make case 1 always win in every
+    containerised deployment and kill the stack on decoding "". The GCP vars
+    below already use the same empty-means-unset rule.
+
+    Env vars:
+      MPASS_SIGNING_KEY_B64          — base64 of an unencrypted PEM RSA private key
+      MPASS_SIGNING_KEY_GCP_PROJECT  — GCP project id            (both required
+      MPASS_SIGNING_KEY_GCP_SECRET   — secret resource name       for the GCP path)
 
     Returns: (private_key, kid)
     """
+    key_b64 = os.environ.get("MPASS_SIGNING_KEY_B64", "").strip()
+    if key_b64:
+        private_key = _decode_signing_key_b64(key_b64)
+        kid = _public_key_fingerprint(private_key.public_key())
+        logger.info(
+            "Loaded RSA signing key from MPASS_SIGNING_KEY_B64 (kid=%s)", kid
+        )
+        return private_key, kid
+
     project_id = os.environ.get("MPASS_SIGNING_KEY_GCP_PROJECT", "").strip()
     secret_name = os.environ.get("MPASS_SIGNING_KEY_GCP_SECRET", "").strip()
 
@@ -237,8 +320,9 @@ def _load_signing_key():
                 )
     else:
         logger.warning(
+            "No signing key configured (MPASS_SIGNING_KEY_B64 empty, and "
             "MPASS_SIGNING_KEY_GCP_PROJECT / MPASS_SIGNING_KEY_GCP_SECRET not "
-            "configured; generating ephemeral in-memory RSA signing key. All "
+            "configured); generating ephemeral in-memory RSA signing key. All "
             "issued tokens will become invalid on the next restart, and "
             "horizontal scaling is not supported in this mode. This is for "
             "local development only."
@@ -250,9 +334,12 @@ def _load_signing_key():
             "oauth2-proxy verifies every id_token against this service's JWKS, "
             "so a per-process uuid4 kid means every restart forces a re-login "
             "across the whole platform and no second replica can verify the "
-            "first's tokens. Set MPASS_SIGNING_KEY_GCP_PROJECT and "
-            "MPASS_SIGNING_KEY_GCP_SECRET (see dev/docs/deploy-signing-key.md), "
-            "or set MPASS_SIGNING_KEY_ALLOW_EPHEMERAL=true for local development."
+            "first's tokens. Set MPASS_SIGNING_KEY_B64 (base64 of an "
+            "unencrypted PEM RSA private key; platform.sh --setup generates "
+            "one), or set MPASS_SIGNING_KEY_GCP_PROJECT and "
+            "MPASS_SIGNING_KEY_GCP_SECRET to use GCP Secret Manager instead "
+            "(see dev/docs/deploy-signing-key.md), or set "
+            "MPASS_SIGNING_KEY_ALLOW_EPHEMERAL=true for local development."
         )
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
