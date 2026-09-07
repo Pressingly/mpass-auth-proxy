@@ -1283,12 +1283,13 @@ def test_load_signing_key_refuses_when_gcp_load_fails(monkeypatch):
     import main
     monkeypatch.setattr(main, "_EPHEMERAL_SIGNING_KEY_ALLOWED", False)
 
-    import sys, types
-    fake_sm = types.ModuleType("google.cloud.secretmanager")
+    # Patch the attribute, not sys.modules -- see _explode_on_gcp below for why
+    # a sys.modules fake is order-dependent and can be silently bypassed.
     def _boom(*a, **k):
         raise RuntimeError("secret manager unreachable")
-    fake_sm.SecretManagerServiceClient = _boom
-    monkeypatch.setitem(sys.modules, "google.cloud.secretmanager", fake_sm)
+    monkeypatch.setattr(
+        "google.cloud.secretmanager.SecretManagerServiceClient", _boom
+    )
 
     with pytest.raises(RuntimeError, match="ephemeral RSA signing key"):
         main._load_signing_key()
@@ -1494,3 +1495,392 @@ class TestEmailCaptureImportTime:
             MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
         )
         assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# MPASS_SIGNING_KEY_B64 — the .env signing-key source (PR F)
+# ---------------------------------------------------------------------------
+
+def _rsa_pem_b64(bits: int = 2048) -> tuple[object, str]:
+    """An RSA private key and its single-line base64-of-PEM encoding.
+
+    No assertion anywhere pins the base64 length: PKCS#8 encoding shifts with
+    leading zeros in the primes, so it varies (2,268 and 2,272 both observed)
+    between keys of the same size."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return key, _b64.b64encode(pem).decode("ascii")
+
+
+def _independent_kid(public_key) -> str:
+    """Recompute the kid from first principles.
+
+    Deliberately not main._public_key_fingerprint -- calling that would test the
+    function against itself and prove nothing about which key was loaded."""
+    from cryptography.hazmat.primitives import serialization
+
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()[:32]
+
+
+def _explode_on_gcp(monkeypatch):
+    """Install a google.cloud.secretmanager whose client fails loudly.
+
+    The suite runs with MPASS_SIGNING_KEY_ALLOW_EPHEMERAL=true, so a
+    fall-through into the GCP branch would otherwise be rescued into an
+    ephemeral key and show up only as a puzzling kid mismatch.
+
+    Patch the attribute, not sys.modules. `from google.cloud import
+    secretmanager` resolves the attribute on the google.cloud namespace package
+    before consulting sys.modules, so once anything has imported the real
+    submodule and left it bound there, a sys.modules fake is silently never
+    reached and the guard becomes decorative.
+
+    Whether that has happened depends on test ordering, which makes the
+    sys.modules form quietly fragile rather than reliably broken: it works
+    today only because the tests that bind the real module happen to run
+    later. Patching the attribute is order-independent."""
+    def _boom(*a, **k):
+        raise AssertionError("GCP branch reached; MPASS_SIGNING_KEY_B64 should have won")
+
+    monkeypatch.setattr(
+        "google.cloud.secretmanager.SecretManagerServiceClient", _boom
+    )
+
+
+class TestSigningKeyFromEnv:
+    """MPASS_SIGNING_KEY_B64 is case 1 of the precedence chain in
+    _load_signing_key. It is read at call time, so most of these can call the
+    function directly; the refuse-to-start cases use a subprocess because that
+    is what a deployment actually experiences."""
+
+    def test_b64_key_is_used_and_kid_matches_that_key(self, monkeypatch, caplog):
+        key, b64 = _rsa_pem_b64()
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", b64)
+        _explode_on_gcp(monkeypatch)
+
+        with caplog.at_level("INFO"):
+            loaded, kid = m._load_signing_key()
+
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+        assert isinstance(loaded, RSAPrivateKey)
+        assert kid == _independent_kid(key.public_key())
+
+        # The source must be named (§1.5) -- otherwise the "no key in the logs"
+        # assertion below would pass on a code path that logged nothing at all.
+        text = caplog.text
+        assert "MPASS_SIGNING_KEY_B64" in text
+        assert f"kid={kid}" in text
+        assert b64 not in text
+        assert b64[:40] not in text
+        assert "-----BEGIN" not in text
+
+    def test_b64_wins_over_gcp_when_both_are_set(self, monkeypatch):
+        key, b64 = _rsa_pem_b64()
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", b64)
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+        _explode_on_gcp(monkeypatch)
+
+        _loaded, kid = m._load_signing_key()
+        assert kid == _independent_kid(key.public_key())
+
+    def test_empty_b64_falls_through_to_gcp(self, monkeypatch):
+        """§1.3: docker-compose passes ${MPASS_SIGNING_KEY_B64:-}, so the
+        variable is present-and-empty in every containerised deployment. Empty
+        must mean unset, or cases 2-4 are unreachable everywhere."""
+        from unittest.mock import MagicMock, patch as _patch
+        from cryptography.hazmat.primitives import serialization
+
+        key, _ = _rsa_pem_b64()
+        pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", "")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+
+        response = MagicMock()
+        response.payload.data = pem
+        gcp_client = MagicMock()
+        gcp_client.access_secret_version.return_value = response
+
+        with _patch("google.cloud.secretmanager.SecretManagerServiceClient",
+                    return_value=gcp_client):
+            _loaded, kid = m._load_signing_key()
+
+        assert kid == _independent_kid(key.public_key())
+
+    def test_whitespace_only_b64_falls_through_to_ephemeral(self, monkeypatch, caplog):
+        """"Set" means non-empty *after stripping*."""
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", "  \n ")
+        monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_PROJECT", raising=False)
+        monkeypatch.delenv("MPASS_SIGNING_KEY_GCP_SECRET", raising=False)
+
+        with caplog.at_level("WARNING"):
+            _loaded, kid = m._load_signing_key()
+
+        assert len(kid) == 32  # uuid4 hex — the ephemeral path
+        assert any("ephemeral" in r.message.lower() for r in caplog.records)
+
+    def test_not_base64_raises(self, monkeypatch):
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", "not base64!!! ***")
+        with pytest.raises(RuntimeError, match="not valid base64"):
+            m._load_signing_key()
+
+    def test_valid_base64_that_is_not_a_pem_key_raises(self, monkeypatch):
+        # Hex is valid base64, which is exactly how an `openssl rand -hex 32`
+        # secret pasted into this variable would fail: it decodes cleanly to 48
+        # bytes of garbage and only step 2 catches it.
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", "a" * 64)
+        with pytest.raises(RuntimeError, match="not a readable"):
+            m._load_signing_key()
+
+    def test_encrypted_pem_raises(self, monkeypatch):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(b"pw"),
+        )
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", _b64.b64encode(pem).decode())
+        with pytest.raises(RuntimeError, match="not a readable"):
+            m._load_signing_key()
+
+    def _non_rsa_b64(self, key) -> str:
+        from cryptography.hazmat.primitives import serialization
+
+        return _b64.b64encode(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )).decode()
+
+    def test_ec_key_raises(self, monkeypatch):
+        """§2.1 step 3. An EC PEM loads fine and yields a plausible kid, so
+        without the RSA type check startup would succeed and the failure would
+        surface as a 500 on the first JWKS fetch -- with nobody able to log in
+        anywhere and the service still reporting healthy."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", self._non_rsa_b64(key))
+        with pytest.raises(RuntimeError, match="RS256"):
+            m._load_signing_key()
+
+    def test_ed25519_key_raises(self, monkeypatch):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        key = ed25519.Ed25519PrivateKey.generate()
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", self._non_rsa_b64(key))
+        with pytest.raises(RuntimeError, match="RS256"):
+            m._load_signing_key()
+
+    def test_undersized_rsa_key_raises(self, monkeypatch):
+        _key, b64 = _rsa_pem_b64(bits=1024)
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", b64)
+        with pytest.raises(RuntimeError, match="1024-bit"):
+            m._load_signing_key()
+
+    def test_malformed_key_still_raises_with_ephemeral_opt_in(self, monkeypatch):
+        """§1.4: a present-but-corrupt key is a configuration error to surface.
+        MPASS_SIGNING_KEY_ALLOW_EPHEMERAL (true for this whole suite) must not
+        rescue it, and neither must a configured GCP pair."""
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", "not base64!!! ***")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_PROJECT", "test-project")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_GCP_SECRET", "test-secret")
+        assert m._EPHEMERAL_SIGNING_KEY_ALLOWED is True
+        with pytest.raises(RuntimeError, match="not valid base64"):
+            m._load_signing_key()
+
+    @pytest.mark.parametrize("make_value", ["undersized", "not_base64", "encrypted_pem"])
+    def test_key_value_never_appears_in_the_exception(self, monkeypatch, make_value):
+        """Not even as a chained __context__ -- a traceback in a support bundle
+        would disclose the platform's identity signing key.
+
+        Parametrized so that each of the three raise sites is covered. An
+        earlier version passed only an undersized key, which lands on the
+        key_size branch -- the one site that formats an integer and so cannot
+        leak. The two sites that wrap a library exception (b64decode and
+        load_pem_private_key) went unchecked, and interpolating the value into
+        either of their messages left the whole suite green."""
+        if make_value == "undersized":
+            _key, b64 = _rsa_pem_b64(bits=1024)
+        elif make_value == "not_base64":
+            # A real key with one character spliced out of the base64 alphabet,
+            # so the value under test is genuine key material.
+            _key, good = _rsa_pem_b64()
+            b64 = good[:40] + "!" + good[41:]
+        else:
+            # An ENCRYPTED PEM, deliberately: it is the only input that reaches
+            # load_pem_private_key carrying real key material. Base64 of
+            # arbitrary bytes also reaches that site, but decodes to something
+            # harmless, so it cannot detect the decoded value being leaked --
+            # verified by mutation, where the harmless variant stayed green.
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            pem = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.BestAvailableEncryption(b"pw"),
+            )
+            b64 = _b64.b64encode(pem).decode()
+
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", b64)
+        with pytest.raises(RuntimeError) as excinfo:
+            m._load_signing_key()
+
+        chain = []
+        exc = excinfo.value
+        while exc is not None:
+            chain.append(str(exc))
+            exc = exc.__cause__ or exc.__context__
+        blob = "\n".join(chain)
+        assert b64[:40] not in blob
+        assert "-----BEGIN" not in blob
+
+    def test_token_signed_with_b64_key_verifies_against_published_jwks(self, monkeypatch):
+        """End to end: the key from .env signs an id_token that oauth2-proxy can
+        verify against the JWKS this service actually serves."""
+        import jwt as _jwt
+
+        key, b64 = _rsa_pem_b64()
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", b64)
+        _explode_on_gcp(monkeypatch)
+        loaded, kid = m._load_signing_key()
+
+        monkeypatch.setattr(m, "_SIGNING_PRIVATE_KEY", loaded)
+        monkeypatch.setattr(m, "_SIGNING_KID", kid)
+
+        token = m._resign_id_token({
+            "sub": "user-1",
+            "email": "user-1@synthetic.example.com",
+            "aud": "test-client",
+            "exp": 9_999_999_999,
+            "iat": 1_000_000_000,
+        })
+
+        response = client.get("/.well-known/jwks.json")
+        assert response.status_code == 200
+        published = response.json()["keys"][0]
+        assert published["kid"] == kid == _independent_kid(key.public_key())
+        assert _jwt.get_unverified_header(token)["kid"] == kid
+
+        decoded = _jwt.decode(
+            token,
+            _jwt.PyJWK.from_dict(published).key,
+            algorithms=["RS256"],
+            audience="test-client",
+            issuer=m.MPASS_PROXY_ISSUER_URL,
+        )
+        assert decoded["sub"] == "user-1"
+
+
+class TestSigningKeyFromEnvImportTime:
+    """The refuse-to-start cases, as a deployment experiences them: a real
+    import in a fresh process. Every flag-on env below carries
+    SYNTHETIC_EMAIL_DOMAIN and LAUNCHPAD_DB_PASSWORD so the *only* thing that
+    can refuse the import is the signing key, and each asserts on the specific
+    message rather than merely on a non-zero exit."""
+
+    _BASE_ENV = dict(TestEmailCaptureImportTime._BASE_ENV)
+
+    def _import_with(self, **overrides) -> subprocess.CompletedProcess:
+        env = {"PATH": os.environ["PATH"], **self._BASE_ENV, **overrides}
+        return subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env, capture_output=True, text=True,
+        )
+
+    def _enabled(self, **overrides) -> subprocess.CompletedProcess:
+        return self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="true",
+            SYNTHETIC_EMAIL_DOMAIN="synthetic.example.com",
+            LAUNCHPAD_DB_PASSWORD="pw",
+            **overrides,
+        )
+
+    def test_valid_b64_key_imports_without_the_ephemeral_opt_in(self):
+        _key, b64 = _rsa_pem_b64()
+        result = self._enabled(MPASS_SIGNING_KEY_B64=b64)
+        assert result.returncode == 0, result.stderr
+
+    def test_empty_b64_with_ephemeral_opt_in_still_imports(self):
+        """The containerised default: docker-compose always sets the variable,
+        empty when unconfigured, and the dev overlay opts into ephemeral. If
+        empty were treated as set, the devstack would die on decoding ""."""
+        result = self._enabled(
+            MPASS_SIGNING_KEY_B64="",
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_empty_b64_without_any_source_refuses(self):
+        result = self._enabled(MPASS_SIGNING_KEY_B64="")
+        assert result.returncode != 0
+        assert "ephemeral RSA signing key" in result.stderr
+        assert "MPASS_SIGNING_KEY_B64" in result.stderr
+
+    def test_malformed_b64_refuses_even_with_the_ephemeral_opt_in(self):
+        result = self._enabled(
+            MPASS_SIGNING_KEY_B64="not base64!!! ***",
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode != 0
+        assert "not valid base64" in result.stderr
+        assert "ephemeral RSA signing key" not in result.stderr
+
+    def test_non_rsa_b64_refuses_even_with_the_ephemeral_opt_in(self):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+
+        pem = ed25519.Ed25519PrivateKey.generate().private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        result = self._enabled(
+            MPASS_SIGNING_KEY_B64=_b64.b64encode(pem).decode(),
+            MPASS_SIGNING_KEY_ALLOW_EPHEMERAL="true",
+        )
+        assert result.returncode != 0
+        assert "RS256" in result.stderr
+
+    def test_flag_off_ignores_a_malformed_key(self):
+        """§1.1: key loading stays inside the _EMAIL_CAPTURE_ENABLED gate. A
+        deployment not running this feature must not be hard-failed by it."""
+        result = self._import_with(
+            LAUNCHPAD_EMAIL_CAPTURE="false",
+            MPASS_SIGNING_KEY_B64="not base64!!! ***",
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_startup_log_names_the_source_but_never_the_key(self):
+        _key, b64 = _rsa_pem_b64()
+        result = self._enabled(MPASS_SIGNING_KEY_B64=b64, LOG_LEVEL="info")
+        assert result.returncode == 0, result.stderr
+
+        captured = result.stdout + result.stderr
+        assert "Loaded RSA signing key from MPASS_SIGNING_KEY_B64" in captured
+        assert "kid=" in captured
+        assert b64 not in captured
+        assert b64[:40] not in captured
+        assert "-----BEGIN" not in captured
