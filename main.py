@@ -140,12 +140,15 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
 # ---------------------------------------------------------------------------
 # RSA signing key (Approach A' — see ADR-0007)
-# Three sources, tried in order by _load_signing_key(): MPASS_SIGNING_KEY_B64,
-# then the MPASS_SIGNING_KEY_GCP_PROJECT / _SECRET pair, then — only with
-# MPASS_SIGNING_KEY_ALLOW_EPHEMERAL — a key generated in memory (dev only: all
-# issued tokens become invalid on restart, and horizontal scaling is not
-# supported in this mode). Loaded only when LAUNCHPAD_EMAIL_CAPTURE is on.
-# See .env.example for the full contract.
+# Three sources, in precedence order by _load_signing_key():
+# MPASS_SIGNING_KEY_B64, then the MPASS_SIGNING_KEY_GCP_PROJECT / _SECRET pair,
+# then — only with MPASS_SIGNING_KEY_ALLOW_EPHEMERAL — a key generated in
+# memory (dev only: all issued tokens become invalid on restart, and horizontal
+# scaling is not supported in this mode). With none of the three configured,
+# startup fails rather than degrading. Only an *absent* source falls through:
+# a B64 value that is set but unreadable is fatal, it does not try GCP next.
+# Loaded only when LAUNCHPAD_EMAIL_CAPTURE is on. See .env.example for the
+# full contract.
 # ---------------------------------------------------------------------------
 
 
@@ -350,7 +353,7 @@ def _load_signing_key():
 
 # Only load a signing key when we are actually the signer. With the feature off
 # oauth2-proxy verifies against the IdP directly and this service never signs
-# anything, so requiring a GCP secret would be a deployment burden for a code
+# anything, so requiring a signing key would be a deployment burden for a code
 # path that does not run.
 if _EMAIL_CAPTURE_ENABLED:
     _SIGNING_PRIVATE_KEY, _SIGNING_KID = _load_signing_key()
