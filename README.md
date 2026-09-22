@@ -56,6 +56,12 @@ Optional: `OIDC_CLIENT_SECRET`, `SESSION_COOKIE_MAX_AGE_SECONDS`,
 `OIDC_LOGOUT_URI`, `LOGOUT_REDIRECT_URL`, `SMB_CORPORATE_ID`, `PORTAL_URL`,
 `LOG_LEVEL`.
 
+Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
+the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),
+`SYNTHETIC_EMAIL_DOMAIN` and `LAUNCHPAD_DB_PASSWORD`. The other `LAUNCHPAD_DB_*`
+values default to the bundle's postgres. `.env.example` describes each one and
+the order the key sources are tried in.
+
 ## Running locally
 
 ```bash
