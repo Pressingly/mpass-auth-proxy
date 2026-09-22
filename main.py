@@ -140,11 +140,12 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
 # ---------------------------------------------------------------------------
 # RSA signing key (Approach A' — see ADR-0007)
-# Loaded from GCP Secret Manager when MPASS_SIGNING_KEY_GCP_PROJECT and
-# MPASS_SIGNING_KEY_GCP_SECRET are set; otherwise generated ephemerally
-# in-memory (dev only — all issued tokens become invalid on restart, and
-# horizontal scaling is not supported in this mode). See dev/docs/deploy-
-# signing-key.md for the deployment runbook.
+# Three sources, tried in order by _load_signing_key(): MPASS_SIGNING_KEY_B64,
+# then the MPASS_SIGNING_KEY_GCP_PROJECT / _SECRET pair, then — only with
+# MPASS_SIGNING_KEY_ALLOW_EPHEMERAL — a key generated in memory (dev only: all
+# issued tokens become invalid on restart, and horizontal scaling is not
+# supported in this mode). Loaded only when LAUNCHPAD_EMAIL_CAPTURE is on.
+# See .env.example for the full contract.
 # ---------------------------------------------------------------------------
 
 
@@ -171,9 +172,9 @@ _EMAIL_CAPTURE_ENABLED: bool = (
 
 
 # Ephemeral keys are a local-development affordance only. Guarding on an opt-in
-# rather than on an environment name means a deploy that forgets the GCP vars
-# stops at startup instead of silently degrading, which is the failure this
-# guard exists to prevent -- an env-name check would pass on any host whose
+# rather than on an environment name means a deploy that configures no key
+# source stops at startup instead of silently degrading, which is the failure
+# this guard exists to prevent -- an env-name check would pass on any host whose
 # ENVIRONMENT var was also unset.
 _EPHEMERAL_SIGNING_KEY_ALLOWED: bool = (
     os.environ.get("MPASS_SIGNING_KEY_ALLOW_EPHEMERAL", "false").strip().lower()
