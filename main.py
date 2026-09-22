@@ -567,9 +567,24 @@ async def _apply_email_overlay(claims: dict) -> dict:
     on that claim -- so a one-second database hiccup silently turns one human
     into two principals, intermittently. A 503 is recoverable; a split identity
     is not."""
-    synthetic_id = claims.get("cognito:username") or claims.get("sub")
+    # cognito:username only. The `sub` fallback that used to sit here mixed two
+    # claim namespaces in a single keyspace with nothing recording which one a
+    # given row came from, so two users from different claim sources could
+    # collide on one synthetic_id -- and foss_users keys on exactly that.
+    # mPass-issued Cognito tokens always carry cognito:username, so the
+    # fallback bought nothing and risked a cross-user identity mix-up.
+    synthetic_id = claims.get("cognito:username")
     if not synthetic_id:
-        return claims
+        # Fail closed, like the lookup failure below. Returning `claims`
+        # unchanged would forward Cognito's own email claim, which for these
+        # users is the literal string `cognito:default_val` -- every app would
+        # then key identity on that shared value. A 503 is recoverable; silently
+        # merging users is not.
+        logger.error(
+            "id_token carries no cognito:username claim; refusing to issue a "
+            "token rather than forwarding an unusable email claim."
+        )
+        raise EmailOverlayUnavailable("id_token has no cognito:username claim")
     try:
         real_email = await _lookup_real_email(synthetic_id)
     except EmailOverlayUnavailable:

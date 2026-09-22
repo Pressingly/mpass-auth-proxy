@@ -429,8 +429,8 @@ class TestBridgeCallbackKidSelection:
         self._seed_state(fake_redis)
         target_key = {"kid": "key-abc", "kty": "RSA", "use": "sig"}
         other_key = {"kid": "key-xyz", "kty": "RSA", "use": "sig"}
-        token = _make_jwt_with_kid({"sub": "alice", "exp": 9_999_999_999}, kid="key-abc")
-        fake_claims = {"iss": _ISSUER, "sub": "alice", "exp": 9_999_999_999}
+        token = _make_jwt_with_kid({"cognito:username": "alice", "sub": "alice", "exp": 9_999_999_999}, kid="key-abc")
+        fake_claims = {"iss": _ISSUER, "cognito:username": "alice", "sub": "alice", "exp": 9_999_999_999}
 
         selected_jwk = {}
 
@@ -459,13 +459,13 @@ class TestBridgeCallbackKidSelection:
 
     def test_no_matching_kid_returns_401_without_calling_decode(self, fake_redis):
         self._seed_state(fake_redis)
-        token = _make_jwt_with_kid({"sub": "alice"}, kid="key-abc")
+        token = _make_jwt_with_kid({"cognito:username": "alice", "sub": "alice"}, kid="key-abc")
 
         decode_was_called = []
 
         def should_not_be_called(*a, **kw):
             decode_was_called.append(True)
-            return {"iss": _ISSUER, "sub": "alice", "exp": 9_999_999_999}
+            return {"iss": _ISSUER, "cognito:username": "alice", "sub": "alice", "exp": 9_999_999_999}
 
         with patch("main._get_jwks", new_callable=AsyncMock) as mock_jwks, \
              patch("main.jwt.decode", side_effect=should_not_be_called):
@@ -492,8 +492,8 @@ class TestBridgeCallbackAtomicStateConsumption:
     def test_bridge_state_absent_from_redis_when_jwt_decode_is_called(self, fake_redis):
         """GETDEL must remove bridge_state before jwt.decode runs, closing the replay window."""
         self._seed_state(fake_redis)
-        id_token = _make_jwt_with_kid({"sub": "u", "exp": 9_999_999_999}, kid="k1")
-        fake_claims = {"iss": _ISSUER, "sub": "u", "exp": 9_999_999_999}
+        id_token = _make_jwt_with_kid({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999}, kid="k1")
+        fake_claims = {"iss": _ISSUER, "cognito:username": "u", "sub": "u", "exp": 9_999_999_999}
 
         state_key = "bridge_state:atomic-test-state"
         state_present_at_decode = []
@@ -535,7 +535,7 @@ class TestBridgeToken:
     ) -> None:
         _, challenge = _make_pkce_pair(verifier)
         fake_redis[f"bridge_code:{code}"] = json.dumps({
-            "id_token": _make_jwt({"sub": "testuser", "exp": int(time.time()) + 3600}),
+            "id_token": _make_jwt({"cognito:username": "testuser", "sub": "testuser", "exp": int(time.time()) + 3600}),
             "access_token": "real.cognito.access_token",
             "refresh_token": refresh_token,
             "code_challenge": challenge,
@@ -743,7 +743,7 @@ class TestTokenEndpointDiscovery:
                 text = ""
                 def json(self): return {
                     "access_token": "x",
-                    "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
+                    "id_token": _make_jwt({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999}),
                     "token_type": "Bearer", "expires_in": 3600,
                 }
             return FakeResp()
@@ -774,7 +774,7 @@ class TestRefreshToken:
         config), its /token response omits `refresh_token`. The bridge must
         echo the original back so oauth2-proxy keeps a valid token for the
         next refresh cycle."""
-        idp_id_token = _make_jwt({"sub": "u", "iss": _ISSUER, "exp": 9_999_999_999})
+        idp_id_token = _make_jwt({"cognito:username": "u", "sub": "u", "iss": _ISSUER, "exp": 9_999_999_999})
 
         async def fake_post(self_inner, url, **kwargs):
             class FakeResp:
@@ -819,7 +819,7 @@ class TestRefreshToken:
                 text = ""
                 def json(self): return {
                     "access_token": "new.cognito.access_token",
-                    "id_token": _make_jwt({"sub": "u", "iss": _ISSUER, "exp": 9_999_999_999}),
+                    "id_token": _make_jwt({"cognito:username": "u", "sub": "u", "iss": _ISSUER, "exp": 9_999_999_999}),
                     "token_type": "Bearer",
                     "expires_in": 3600,
                     "refresh_token": "rotated.refresh.token",
@@ -967,6 +967,13 @@ _CORPORATE_ID = "corp-uuid-1234"
 def _cognito_access_claims(**overrides):
     base = {
         "sub": "alice",
+        # Cognito access tokens carry `username`, not `cognito:username`. It is
+        # here because these tests patch jwt.decode globally, so the id_token in
+        # the refresh flow decodes to this same dict -- and the email overlay
+        # reads cognito:username off the id_token. Without it the overlay fails
+        # closed (correctly) and the corporate-id assertions never run.
+        "cognito:username": "alice",
+        "username": "alice",
         "client_id": _CLIENT_ID,
         "token_use": "access",
         "iss": _ISSUER,
@@ -990,9 +997,9 @@ class TestCorporateIdValidation:
 
     def _do_callback(self, fake_redis, access_claims, *, enforce_id=_CORPORATE_ID):
         self._seed_bridge_state(fake_redis)
-        id_token = _make_jwt_with_kid({"sub": "alice", "exp": 9_999_999_999}, kid="k1")
+        id_token = _make_jwt_with_kid({"cognito:username": "alice", "sub": "alice", "exp": 9_999_999_999}, kid="k1")
         access_token = _make_jwt_with_kid(access_claims, kid="k1")
-        id_claims = {"iss": _ISSUER, "sub": "alice", "exp": 9_999_999_999}
+        id_claims = {"iss": _ISSUER, "cognito:username": "alice", "sub": "alice", "exp": 9_999_999_999}
 
         with patch.object(m, "SMB_CORPORATE_ID", enforce_id), \
              patch("main._get_jwks", new_callable=AsyncMock) as mock_jwks, \
@@ -1111,7 +1118,7 @@ class TestRefreshTokenCorporateId:
                 text = ""
                 def json(self_resp): return {
                     "access_token": "new.access",
-                    "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
+                    "id_token": _make_jwt({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999}),
                     "token_type": "Bearer", "expires_in": 3600,
                 }
             return FakeResp()
@@ -1171,6 +1178,42 @@ async def test_overlay_sets_synthetic_email_for_unverified_user():
 
 
 @pytest.mark.asyncio
+async def test_overlay_keys_on_cognito_username_not_sub():
+    """The sub fallback was removed deliberately. Two claim namespaces sharing
+    one keyspace meant users from different sources could collide on a single
+    synthetic_id, and foss_users keys on exactly that."""
+    from main import _apply_email_overlay
+
+    claims = {"sub": "SUB-VALUE", "cognito:username": "USERNAME-VALUE", "email": "x@y.z"}
+    seen = {}
+
+    async def _capture(sid):
+        seen["sid"] = sid
+        return None
+
+    with patch("main._lookup_real_email", new=_capture):
+        out = await _apply_email_overlay(claims)
+
+    assert seen["sid"] == "USERNAME-VALUE"
+    assert out["preferred_username"] == "USERNAME-VALUE"
+    assert "SUB-VALUE" not in out["email"]
+
+
+@pytest.mark.asyncio
+async def test_overlay_refuses_a_token_with_no_cognito_username():
+    """Fail closed. Forwarding the claims unchanged would hand every app
+    Cognito's own email claim, which for these users is the shared literal
+    `cognito:default_val` -- silently merging distinct humans onto one
+    identity."""
+    from main import EmailOverlayUnavailable, _apply_email_overlay
+
+    claims = {"sub": "SUB-ONLY", "email": "cognito:default_val"}
+    with patch("main._lookup_real_email", new=AsyncMock(return_value="real@example.com")):
+        with pytest.raises(EmailOverlayUnavailable):
+            await _apply_email_overlay(claims)
+
+
+@pytest.mark.asyncio
 async def test_overlay_raises_on_db_error():
     """A lookup failure must not be reported as "no verified email".
 
@@ -1197,7 +1240,7 @@ async def test_token_refresh_returns_503_when_overlay_unavailable(
             text = ""
             def json(self_resp): return {
                 "access_token": "new.access",
-                "id_token": _make_jwt({"sub": "u", "exp": 9_999_999_999}),
+                "id_token": _make_jwt({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999}),
                 "token_type": "Bearer", "expires_in": 3600,
             }
         return FakeResp()
@@ -1400,7 +1443,7 @@ class TestEmailCaptureDisabled:
 
         oauth2-proxy is pointed at the IdP's JWKS when the flag is off, so
         anything other than a verbatim echo fails verification for every user."""
-        idp_token = _make_jwt({"sub": "u", "email": "real@corp.example",
+        idp_token = _make_jwt({"cognito:username": "u", "sub": "u", "email": "real@corp.example",
                                "exp": 9_999_999_999})
         with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False):
             out = await m._issue_id_token(idp_token)
@@ -1410,7 +1453,7 @@ class TestEmailCaptureDisabled:
     async def test_disabled_path_never_touches_the_launchpad_database(self):
         """A launchpad DB that does not exist yet must not affect logins."""
         lookup = AsyncMock(side_effect=AssertionError("must not be called"))
-        idp_token = _make_jwt({"sub": "u", "exp": 9_999_999_999})
+        idp_token = _make_jwt({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999})
         with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False), \
              patch("main._lookup_real_email", new=lookup):
             out = await m._issue_id_token(idp_token)
