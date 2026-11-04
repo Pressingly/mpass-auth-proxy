@@ -823,12 +823,17 @@ async def bridge_authorize(request: Request) -> Response:
     if not parsed.netloc or not parsed.netloc.endswith(_PLATFORM_DOMAIN_SUFFIX):
         return Response(status_code=400, content="Invalid redirect_uri")
 
-    bridge_data = json.dumps({
+    return await _begin_moneta_login(state, {
         "redirect_uri": redirect_uri,
         "state": state,
         "code_challenge": code_challenge,
     })
-    await redis_client.setex(f"bridge_state:{state}", BRIDGE_STATE_TTL, bridge_data)
+
+
+async def _begin_moneta_login(state: str, bridge_data: dict) -> Response:
+    """Park the flow's bridge state under `state` and send the browser to the
+    Moneta hosted UI; /mpass-callback resumes it from the mpass_bridge cookie."""
+    await redis_client.setex(f"bridge_state:{state}", BRIDGE_STATE_TTL, json.dumps(bridge_data))
 
     response = RedirectResponse(url=_moneta_login_url(), status_code=302)
     response.set_cookie(
@@ -1129,8 +1134,10 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
         return _TokenOutcome(502, "Token refresh failed")
 
 
-async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
-    token_ref = _token_ref(refresh_token)
+async def _post_refresh_grant(refresh_token: str) -> httpx.Response:
+    """POST a refresh_token grant to the IdP's token endpoint. Shared by the
+    oauth2-proxy refresh path and the Buzz adapter's session revalidation, so
+    both make the identical IdP call."""
     payload: dict = {
         "grant_type": "refresh_token",
         "client_id": OIDC_CLIENT_ID,
@@ -1139,14 +1146,20 @@ async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
     if OIDC_CLIENT_SECRET:
         payload["client_secret"] = OIDC_CLIENT_SECRET
 
+    token_url = await _get_token_endpoint()
+    async with httpx.AsyncClient(timeout=_IDP_REFRESH_TIMEOUT_SECONDS) as client:
+        return await client.post(
+            token_url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+
+async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
+    token_ref = _token_ref(refresh_token)
+
     try:
-        token_url = await _get_token_endpoint()
-        async with httpx.AsyncClient(timeout=_IDP_REFRESH_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                token_url,
-                data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+        resp = await _post_refresh_grant(refresh_token)
     except httpx.HTTPError as exc:
         logger.error(
             "bridge_token refresh: IdP request failed token=%s: %s: %s",
