@@ -41,12 +41,10 @@ so auth breaks silently rather than erroring.
 The router rule does **not** live in this repository. It is the
 `traefik.http.routers.mpass-bridge.rule` label on the `mpass-auth-proxy` service
 in `docker-compose.yml` in `Pressingly/foss-server-bundle` (private), and it
-currently lists exactly the six non-`/nip-fa/` paths in the table above other
-than `/.well-known/jwks.json`, which oauth2-proxy reads on the internal network.
-Every Buzz adapter route lives under `/nip-fa/` (see `nip_fa/`), so the rule needs
-one `PathPrefix(`/nip-fa/`)` for all of them rather than a `Path()` per route. A
-Buzz relay that fetches the JWKS from the adapter's public origin also needs
-`Path(`/.well-known/jwks.json`)` on that router.
+currently lists every non-`/nip-fa/` path in the table above, including
+`/.well-known/jwks.json`. Every Buzz adapter route lives under `/nip-fa/` (see
+`nip_fa/`), so the rule needs one `PathPrefix(`/nip-fa/`)` for all of them rather
+than a `Path()` per route; that is the only addition the adapter needs there.
 
 So adding, renaming or removing a route here is a **two-repo change**: land the
 route in this repo, then open a coordinated PR against foss-server-bundle
