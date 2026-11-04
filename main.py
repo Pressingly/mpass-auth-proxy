@@ -1004,15 +1004,8 @@ async def _handle_authorization_code(code: str, code_verifier: str) -> Response:
     if not code_verifier:
         logger.warning("bridge_token: empty code_verifier")
         return _token_error("invalid_grant", "Missing code_verifier")
-    logger.warning(
-        "bridge_token: PKCE check — verifier=%s… challenge=%s…",
-        code_verifier[:12], code_data["code_challenge"][:12],
-    )
     if not _verify_pkce(code_verifier, code_data["code_challenge"]):
-        logger.warning(
-            "bridge_token: PKCE verification failed — full verifier=%s challenge=%s",
-            code_verifier, code_data["code_challenge"],
-        )
+        logger.warning("bridge_token: PKCE verification failed")
         return _token_error("invalid_grant", "PKCE verification failed")
 
     try:
