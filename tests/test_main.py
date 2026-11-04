@@ -605,6 +605,25 @@ class TestBridgeToken:
         )
         assert response.status_code == 400
 
+    @pytest.mark.parametrize("verifier", ["totally-wrong-verifier", _TEST_PKCE_VERIFIER])
+    def test_pkce_values_never_reach_logs(self, fake_redis, caplog, verifier):
+        self._seed_bridge_code(fake_redis)
+        _, challenge = _make_pkce_pair(_TEST_PKCE_VERIFIER)
+
+        with caplog.at_level(logging.DEBUG):
+            client.post(
+                "/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": "test-code-uuid",
+                    "code_verifier": verifier,
+                },
+            )
+
+        logged = caplog.text
+        assert verifier[:8] not in logged
+        assert challenge[:8] not in logged
+
     def test_missing_code_verifier_returns_400(self, fake_redis):
         self._seed_bridge_code(fake_redis)
         response = client.post(
