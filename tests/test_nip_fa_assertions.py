@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 from dataclasses import replace
+from urllib.parse import urlsplit
 
 import httpx
 import jwt as pyjwt
@@ -48,11 +49,11 @@ class _FakePipeline:
     async def __aexit__(self, *exc):
         return False
 
+    def set(self, key, value, ex=None, nx=False):
+        self._ops.append((self._redis.set_now, key, value, ex, nx))
+
     def incr(self, key):
         self._ops.append((self._redis.incr_now, key))
-
-    def expire(self, key, seconds, nx=False):
-        self._ops.append((self._redis.expire_now, key, seconds, nx))
 
     def ttl(self, key):
         self._ops.append((self._redis.ttl_now, key))
@@ -73,15 +74,16 @@ class _CountingRedis(_RecordingRedis):
         self.transactions.append(transaction)
         return _FakePipeline(self)
 
+    def set_now(self, key, value, ex, nx):
+        if nx and key in self.values:
+            return None
+        self.values[key] = str(value)
+        self.ttls[key] = ex
+        return True
+
     def incr_now(self, key):
         self.values[key] = str(int(self.values.get(key, "0")) + 1)
         return int(self.values[key])
-
-    def expire_now(self, key, seconds, nx):
-        if nx and key in self.ttls:
-            return False
-        self.ttls[key] = seconds
-        return True
 
     def ttl_now(self, key):
         return self.ttls.get(key, -1)
@@ -255,6 +257,40 @@ class TestAssertionIssuance:
 
         assert body["expires_at"] == _T0 + 120
         assert pyjwt.decode(body["assertion"], options={"verify_signature": False})["exp"] == _T0 + 120
+
+    def test_last_second_of_the_session_still_yields_exp_after_iat(self, redis_store, clock, identity_store):
+        token = _open_session(Identity(sub=_MPASS_ID, cognito_sub="c", email=None), ttl_seconds=1)
+
+        body = _request_assertion(token).json()
+
+        claims = pyjwt.decode(body["assertion"], options={"verify_signature": False})
+        assert claims["exp"] == _T0 + 1 > claims["iat"] == _T0
+
+    def test_session_ending_between_lookup_and_issuance_is_session_expired(
+        self, redis_store, clock, identity_store, monkeypatch
+    ):
+        token = _open_session(Identity(sub=_MPASS_ID, cognito_sub="c", email=None), ttl_seconds=1)
+        readings = iter([_T0, _T0 + 1])
+        monkeypatch.setattr(m._buzz_adapter.sessions, "now", lambda: next(readings))
+
+        response = _request_assertion(token)
+
+        assert _denial(response) == (401, {"error": "session_expired"})
+        assert identity_store.calls == []
+
+    def test_buzz_app_shaped_request(self, redis_store, clock, identity_store):
+        token = _signed_in(redis_store, clock)
+        body = json.dumps(
+            {"nostr_pubkey": _expected_keypair().pubkey_hex, "relay_url": _relay()}, separators=(",", ":")
+        ).encode("utf-8")
+        event = signed_event(_user_secret(), tags=_tags(body), created_at=_T0)
+        header_json = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        proof = "Nostr " + base64.b64encode(header_json).decode("ascii")
+
+        response = _request_assertion(token, body=body, proof=proof)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["nostr_pubkey"] == _expected_keypair().pubkey_hex
 
     def test_ttl_comes_from_config(self, redis_store, clock, identity_store, monkeypatch):
         monkeypatch.setattr(m._buzz_adapter, "_config", replace(_config(), assertion_ttl_seconds=45))
@@ -540,6 +576,11 @@ class TestAssertionLogging:
 
 
 class TestRouteMounting:
+    def test_mounted_path_is_the_path_proofs_are_bound_to(self):
+        [route] = [route for route in m.app.routes if getattr(route, "endpoint", None) == m._buzz_adapter.issue_assertion]
+        assert route.path == urlsplit(_config().assertions_url).path == _ROUTE
+        assert route.methods == {"POST"}
+
     def test_only_post_is_routed(self, redis_store, clock, identity_store):
         token = _signed_in(redis_store, clock)
         assert client.get(_ROUTE, headers={"Authorization": f"Bearer {token}"}).status_code == 405

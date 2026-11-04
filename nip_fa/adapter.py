@@ -47,6 +47,7 @@ from .responses import (
     session_expired,
     session_required,
 )
+from .routes import ASSERTIONS_ROUTE, ROUTE_PREFIX
 from .sealing import LOGIN_CODE_RECORD, RecordSealer
 from .sessions import (
     Identity,
@@ -64,7 +65,6 @@ from .validation import challenge_matches, parse_exchange_body, parse_login_star
 
 logger = logging.getLogger(__name__)
 
-ROUTE_PREFIX = "/nip-fa"
 FLOW_TAG = "nip-fa"
 CODE_TTL_SECONDS = 120
 MAX_EXCHANGE_BODY_BYTES = 4096
@@ -213,7 +213,7 @@ class NipFaAdapter:
         router.add_api_route("/v1/login/exchange", self.exchange_code, methods=["POST"])
         router.add_api_route("/v1/session", self.check_session, methods=["GET"])
         router.add_api_route("/v1/identity/key", self.issue_identity_key, methods=["GET"])
-        router.add_api_route("/v1/identity/assertions", self.issue_assertion, methods=["POST"])
+        router.add_api_route(ASSERTIONS_ROUTE, self.issue_assertion, methods=["POST"])
         return router
 
     def owns(self, bridge_data: dict) -> bool:
@@ -353,6 +353,8 @@ class NipFaAdapter:
             return inputs
         identity = lookup.session.identity
         now = self.sessions.now()
+        if lookup.session.expired_at(now):
+            return session_expired()
         denial = self._proof_denial(identity, inputs, now)
         if denial is not None:
             return denial

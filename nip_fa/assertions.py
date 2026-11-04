@@ -41,7 +41,6 @@ def parse_assertion_body(raw: bytes) -> AssertionRequest | None:
     return AssertionRequest(relay_url=relay_url, nostr_pubkey=pubkey)
 
 
-
 def is_publishable_profile(profile: dict | None) -> bool:
     """The relay's `nostr_public_profile` rules (buzz-auth public_profile.rs):
     anything else is dropped relay-side, so it is not sent at all."""
@@ -141,9 +140,11 @@ class AssertionRateLimiter:
         return RateDecision(allowed=False, retry_after_seconds=max(ttl, 1))
 
     async def _count(self, key: str) -> tuple[int, int]:
+        """One MULTI: create the window with its TTL if absent, then count. Uses
+        only commands every Redis and Valkey version has (no `EXPIRE ... NX`)."""
         async with self._redis_factory().pipeline(transaction=True) as pipe:
+            pipe.set(key, 0, ex=self._window_seconds, nx=True)
             pipe.incr(key)
-            pipe.expire(key, self._window_seconds, nx=True)
             pipe.ttl(key)
-            count, _, ttl = await pipe.execute()
+            _, count, ttl = await pipe.execute()
         return int(count), int(ttl)

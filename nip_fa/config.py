@@ -5,13 +5,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from .routes import ASSERTIONS_PATH
 from .urls import is_canonical_https_origin, is_canonical_relay_url
 
 DEFAULT_SESSION_TTL_SECONDS = 2_592_000
 DEFAULT_ASSERTION_TTL_SECONDS = 300
 MIN_ASSERTION_TTL_SECONDS = 30
 MAX_ASSERTION_TTL_SECONDS = 3600
-ASSERTIONS_PATH = "/nip-fa/v1/identity/assertions"
 _DEFAULT_MPASS_PROXY_ISSUER_URL = "http://mpass-auth-proxy:8000"
 
 _TRUTHY = {"1", "true", "yes"}

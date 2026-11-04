@@ -429,7 +429,7 @@ class TestLaunchpadIdentityStore:
 class TestLaunchpadOutageLog:
     @pytest.mark.parametrize("capture_on, expected", [
         (True, "ALL token exchanges and session refreshes will return 503"),
-        (False, "Buzz identity keys will return 503"),
+        (False, "Buzz identity keys and relay assertions will return 503"),
     ])
     def test_names_the_real_impact(self, monkeypatch, capture_on, expected):
         monkeypatch.setattr(m, "_EMAIL_CAPTURE_ENABLED", capture_on)

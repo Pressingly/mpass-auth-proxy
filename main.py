@@ -341,11 +341,12 @@ def _load_signing_key():
 
     if not _EPHEMERAL_SIGNING_KEY_ALLOWED:
         raise RuntimeError(
-            "Refusing to start with an ephemeral RSA signing key. "
-            "oauth2-proxy verifies every id_token against this service's JWKS, "
-            "so a per-process uuid4 kid means every restart forces a re-login "
-            "across the whole platform and no second replica can verify the "
-            "first's tokens. Set MPASS_SIGNING_KEY_B64 (base64 of an "
+            "Refusing to start with an ephemeral RSA signing key, required because "
+            "LAUNCHPAD_EMAIL_CAPTURE or BUZZ_ADAPTER_ENABLED is on. oauth2-proxy "
+            "(email capture) and the Buzz relays (NIP-FI assertions) verify "
+            "against this service's JWKS, so a per-process uuid4 kid means every "
+            "restart invalidates every outstanding token and no second replica "
+            "can verify the first's tokens. Set MPASS_SIGNING_KEY_B64 (base64 of an "
             "unencrypted PEM RSA private key; platform.sh --setup generates "
             "one), or set MPASS_SIGNING_KEY_GCP_PROJECT and "
             "MPASS_SIGNING_KEY_GCP_SECRET to use GCP Secret Manager instead "
@@ -517,7 +518,10 @@ class EmailOverlayUnavailable(Exception):
 def _launchpad_outage_impact() -> str:
     if _EMAIL_CAPTURE_ENABLED:
         return "ALL token exchanges and session refreshes will return 503"
-    return "Buzz identity keys will return 503 (email capture is off, so logins are unaffected)"
+    return (
+        "Buzz identity keys and relay assertions will return 503 "
+        "(email capture is off, so logins are unaffected)"
+    )
 
 
 async def _get_launchpad_pool() -> asyncpg.Pool:
@@ -803,7 +807,8 @@ async def jwks() -> dict:
             status_code=404,
             detail=(
                 "mpass-auth-proxy is not the token signer: LAUNCHPAD_EMAIL_CAPTURE "
-                "is off, so oauth2-proxy must verify against the IdP's JWKS."
+                "and BUZZ_ADAPTER_ENABLED are both off, so oauth2-proxy must verify "
+                "against the IdP's JWKS and no Buzz relay has a key to fetch here."
             ),
         )
     return _jwks_document()
