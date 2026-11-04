@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -117,3 +118,42 @@ class TestAdapterStartup:
         assert result.returncode != 0
         assert "64 hex characters" in result.stderr
         assert bad_secret not in result.stderr
+
+
+_FLAG_OFF_CALLBACK = """
+import json, sys
+import main
+from fastapi.testclient import TestClient
+
+class OneStateRedis:
+    def __init__(self, state):
+        self.values = {"bridge_state:s1": json.dumps(state)}
+
+    async def getdel(self, key):
+        return self.values.pop(key, None)
+
+main.redis_client = OneStateRedis(json.loads(sys.argv[1]))
+client = TestClient(main.app, raise_server_exceptions=False)
+response = client.get(
+    "/mpass-callback", params={"id_token": "a.b.c"}, cookies={"mpass_bridge": "s1"}, follow_redirects=False
+)
+print(response.status_code, response.headers.get("location", ""))
+"""
+
+
+class TestFlagOffCallback:
+    @pytest.mark.parametrize("bridge_state", [
+        {"flow": "nip-fa", "return_to": "http://127.0.0.1:5000/cb", "handoff_challenge": "x" * 43},
+        {"redirect_uri": "https://auth.example.com/oauth2/callback", "state": "s1"},
+    ])
+    def test_state_for_no_enabled_flow_redirects_to_portal(self, bridge_state):
+        env = {"PATH": os.environ["PATH"], **_BASE_ENV}
+        result = subprocess.run(
+            [sys.executable, "-c", _FLAG_OFF_CALLBACK, json.dumps(bridge_state)],
+            cwd=_REPO_ROOT, env=env, capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        status, location = result.stdout.split()
+        assert status == "302"
+        assert "login_error=expired_flow" in location
+        assert "127.0.0.1" not in location

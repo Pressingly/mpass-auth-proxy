@@ -896,6 +896,10 @@ async def _bridge_callback_impl(request: Request) -> Response:
     except json.JSONDecodeError:
         return Response(status_code=500, content="Corrupt bridge state")
 
+    if not _is_buzz_login(bridge_data) and not _is_oauth2_bridge_state(bridge_data):
+        logger.info("mpass-callback: bridge state belongs to no enabled flow — redirecting to portal")
+        return _portal_redirect_with_error("expired_flow")
+
     try:
         jwks = await _get_jwks()
         header = jwt.get_unverified_header(id_token)
@@ -931,7 +935,7 @@ async def _bridge_callback_impl(request: Request) -> Response:
     except CorporateIdMismatch as exc:
         logger.warning("bridge_callback: corporate-id check failed: %s", exc)
         if _is_buzz_login(bridge_data):
-            return _buzz_adapter.deny_login(bridge_data)
+            return _buzz_adapter.deny_login(bridge_data, "access_denied", exc.reason or None)
         return _portal_redirect_with_error("access_denied", reason=exc.reason)
 
     if _is_buzz_login(bridge_data):
@@ -1293,3 +1297,9 @@ if _buzz_adapter is not None:
 
 def _is_buzz_login(bridge_data: dict) -> bool:
     return _buzz_adapter is not None and _buzz_adapter.owns(bridge_data)
+
+
+def _is_oauth2_bridge_state(bridge_data: dict) -> bool:
+    return "flow" not in bridge_data and all(
+        bridge_data.get(field) for field in ("redirect_uri", "state", "code_challenge")
+    )

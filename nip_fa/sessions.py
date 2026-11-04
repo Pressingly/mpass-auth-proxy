@@ -10,8 +10,9 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
+import jwt
 
-from .sealing import seal, unseal
+from .sealing import SESSION_REFRESH_TOKEN, seal, unseal
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ def new_session_token() -> str:
 def encode_record(session_token: str, session: Session) -> str:
     return json.dumps({
         "identity": asdict(session.identity),
-        "sealed_refresh_token": seal(session_token, session.refresh_token),
+        "sealed_refresh_token": seal(session_token, session.refresh_token, SESSION_REFRESH_TOKEN),
         "expires_at": session.expires_at,
         "revalidated_at": session.revalidated_at,
     })
@@ -95,7 +96,7 @@ def encode_record(session_token: str, session: Session) -> str:
 def decode_record(session_token: str, raw: str) -> Session | None:
     """The session, or None when the record cannot be trusted for this token."""
     data = json.loads(raw)
-    refresh_token = unseal(session_token, data["sealed_refresh_token"])
+    refresh_token = unseal(session_token, data["sealed_refresh_token"], SESSION_REFRESH_TOKEN)
     if refresh_token is None:
         return None
     return Session(
@@ -198,7 +199,7 @@ class SessionService:
     async def _ask_idp(self, session: Session) -> tuple[Revalidation, str | None]:
         try:
             response = await self._idp.refresh_grant(session.refresh_token)
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             logger.warning("nip-fa: refresh grant failed: %s", type(exc).__name__)
             return Revalidation.UNAVAILABLE, None
         if response.status_code != 200:
@@ -209,7 +210,7 @@ class SessionService:
             return Revalidation.UNAVAILABLE, None
         try:
             allowed = await self._idp.corporate_id_allowed(access_token)
-        except Exception as exc:
+        except (httpx.HTTPError, jwt.PyJWTError) as exc:
             logger.warning("nip-fa: corporate-id check failed: %s", type(exc).__name__)
             return Revalidation.UNAVAILABLE, None
         if not allowed:

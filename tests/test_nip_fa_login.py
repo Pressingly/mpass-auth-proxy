@@ -6,13 +6,15 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
+import jwt as pyjwt
 import pytest
 from fastapi.testclient import TestClient
 
 import main as m
-from nip_fa.sealing import seal, unseal
+from nip_fa.sealing import LOGIN_CODE_REFRESH_TOKEN, SESSION_REFRESH_TOKEN, seal, unseal
 from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, decode_record, session_key
-from nip_fa.validation import b64url_sha256, is_loopback_callback, is_sha256_challenge
+from nip_fa.bodies import RequestTooLarge, read_body_within
+from nip_fa.validation import b64url_sha256, is_loopback_callback, is_sha256_challenge, with_query_params
 from tests.test_main import (  # noqa: F401  (autouse fixtures apply by import)
     _CLIENT_ID,
     _ISSUER,
@@ -213,6 +215,14 @@ class TestReturnToValidation:
         "http://127.0.0.1:8080/cb#frag",
         "http://127.0.0.1:8080/c b",
         "http://127.0.0.1:8080/cb\\x",
+        "http://[::1:8080/cb",
+        "http://[zz]:8080/cb",
+        "http://::1]:8080/cb",
+        "http://[::1]]:8080/cb",
+        "http://127.0.0.1:8080/cb?code=planted",
+        "http://127.0.0.1:8080/cb?a=1&error=planted",
+        "http://127.0.0.1:8080/cb?error_description=x",
+        "http://127.0.0.1:8080/cb?%63ode=planted",
         "/callback",
         "127.0.0.1:8080/cb",
         "",
@@ -227,6 +237,26 @@ class TestReturnToValidation:
         assert response.headers["cache-control"] == "no-store"
         assert "location" not in response.headers
         assert redis_store.values == {}
+
+
+    @pytest.mark.parametrize("return_to", ["http://[::1:8080/cb", "http://127.0.0.1:8080/cb?code=planted"])
+    def test_malformed_or_reserved_return_to_is_400_at_the_route(self, redis_store, return_to):
+        response = _start(return_to=return_to)
+        assert response.status_code == 400
+        assert response.json() == {"error": "invalid_request"}
+        assert response.headers["cache-control"] == "no-store"
+        assert redis_store.values == {}
+
+    @pytest.mark.parametrize(("return_to", "expected"), [
+        ("http://127.0.0.1:5000/cb", "http://127.0.0.1:5000/cb?code=C"),
+        ("http://127.0.0.1:5000/cb?a=b%20c", "http://127.0.0.1:5000/cb?a=b%20c&code=C"),
+        ("http://127.0.0.1:5000/cb?flag", "http://127.0.0.1:5000/cb?flag&code=C"),
+        ("http://127.0.0.1:5000/cb?x=%2F&y=+", "http://127.0.0.1:5000/cb?x=%2F&y=+&code=C"),
+        ("http://127.0.0.1:5000/cb?", "http://127.0.0.1:5000/cb?code=C"),
+        ("http://127.0.0.1:5000/cb?a=1&", "http://127.0.0.1:5000/cb?a=1&code=C"),
+    ])
+    def test_callback_url_keeps_return_to_byte_for_byte(self, return_to, expected):
+        assert with_query_params(return_to, {"code": "C"}) == expected
 
 
 class TestLoginStart:
@@ -293,12 +323,21 @@ class TestLoginCallback:
         assert code not in code_keys[0]
         assert 60 <= redis_store.ttls[code_keys[0]] <= 120
 
+    def test_code_record_holds_no_plaintext_refresh_token(self, redis_store, clock):
+        code = _login_code()
+        raw = redis_store.values[redis_store.keys_with_prefix("nip_fa_code:")[0]]
+        assert _REFRESH_TOKEN not in raw
+        assert "refresh_token" not in json.loads(raw)
+        assert unseal(code, json.loads(raw)["sealed_refresh_token"], LOGIN_CODE_REFRESH_TOKEN) == _REFRESH_TOKEN
+
     def test_preserves_existing_return_to_query(self, redis_store, clock):
-        start = _start(return_to="http://[::1]:4000/cb?client=buzz")
+        return_to = "http://[::1]:4000/cb?client=buzz%20desktop&flag"
+        start = _start(return_to=return_to)
         response = _callback(_bridge_state(start))
-        query = parse_qs(urlsplit(response.headers["location"]).query)
-        assert query["client"] == ["buzz"]
-        assert "code" in query
+        location = response.headers["location"]
+        assert location.startswith(return_to + "&code=")
+        code = location.removeprefix(return_to + "&code=")
+        assert code and "&" not in code
 
     def test_corporate_id_failure_redirects_to_return_to_with_access_denied(self, redis_store, clock):
         start = _start()
@@ -311,7 +350,7 @@ class TestLoginCallback:
         assert response.status_code == 302
         location = urlsplit(response.headers["location"])
         assert response.headers["location"].startswith(_RETURN_TO)
-        assert parse_qs(location.query) == {"error": ["access_denied"]}
+        assert parse_qs(location.query) == {"error": ["access_denied"], "error_description": ["wrong_organization"]}
         assert "login_error" not in response.headers["location"]
         assert redis_store.keys_with_prefix("nip_fa_code:") == []
 
@@ -428,6 +467,17 @@ class TestCodeExchange:
         assert response.status_code == 413
         assert response.json() == {"error": "request_too_large"}
 
+    def test_oversized_chunked_body_is_rejected(self, redis_store):
+        def chunks():
+            for _ in range(100):
+                yield b"x" * 1024
+
+        response = client.post(
+            "/nip-fa/v1/login/exchange", content=chunks(), headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 413
+        assert response.json() == {"error": "request_too_large"}
+
     def test_content_encoded_body_is_rejected(self, redis_store):
         response = client.post(
             "/nip-fa/v1/login/exchange",
@@ -486,16 +536,23 @@ class TestRefreshTokenSealing:
         assert decode_record(token, raw).refresh_token == _REFRESH_TOKEN
 
     def test_seal_round_trips_with_a_fresh_nonce_each_time(self):
-        first, second = seal("token-a", _REFRESH_TOKEN), seal("token-a", _REFRESH_TOKEN)
+        first = seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN)
+        second = seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN)
         assert first != second
-        assert unseal("token-a", first) == unseal("token-a", second) == _REFRESH_TOKEN
+        assert unseal("token-a", first, SESSION_REFRESH_TOKEN) == _REFRESH_TOKEN
+        assert unseal("token-a", second, SESSION_REFRESH_TOKEN) == _REFRESH_TOKEN
 
     @pytest.mark.parametrize("sealed", ["", "not base64!", "AAAA", None])
     def test_unseal_fails_closed_on_garbage(self, sealed):
-        assert unseal("token-a", sealed) is None
+        assert unseal("token-a", sealed, SESSION_REFRESH_TOKEN) is None
 
     def test_unseal_with_another_token_fails(self):
-        assert unseal("token-b", seal("token-a", _REFRESH_TOKEN)) is None
+        assert unseal("token-b", seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN), SESSION_REFRESH_TOKEN) is None
+
+    def test_labels_do_not_open_each_other(self):
+        sealed = seal("secret", _REFRESH_TOKEN, LOGIN_CODE_REFRESH_TOKEN)
+        assert unseal("secret", sealed, SESSION_REFRESH_TOKEN) is None
+        assert unseal("secret", sealed, LOGIN_CODE_REFRESH_TOKEN) == _REFRESH_TOKEN
 
     def test_record_moved_under_another_token_is_not_trusted(self, redis_store, clock):
         victim = _signed_in(redis_store, clock)
@@ -506,6 +563,45 @@ class TestRefreshTokenSealing:
         assert response.status_code == 401
         assert response.json() == {"error": "session_required"}
         assert _session(victim).status_code == 200
+
+
+class _StubRequest:
+    def __init__(self, headers: dict, chunks: list[bytes]):
+        self.headers = headers
+        self._chunks = chunks
+        self.chunks_read = 0
+
+    async def stream(self):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+class TestBoundedBodyReader:
+    @pytest.mark.asyncio
+    async def test_declared_oversize_is_refused_before_reading(self):
+        request = _StubRequest({"content-length": "4097"}, [b"x"])
+        with pytest.raises(RequestTooLarge):
+            await read_body_within(request, 4096)
+        assert request.chunks_read == 0
+
+    @pytest.mark.asyncio
+    async def test_streamed_oversize_stops_at_the_chunk_that_crosses_the_limit(self):
+        request = _StubRequest({}, [b"x" * 3000, b"x" * 3000, b"x" * 3000])
+        with pytest.raises(RequestTooLarge):
+            await read_body_within(request, 4096)
+        assert request.chunks_read == 2
+
+    @pytest.mark.asyncio
+    async def test_understated_content_length_is_still_bounded(self):
+        request = _StubRequest({"content-length": "10"}, [b"x" * 5000])
+        with pytest.raises(RequestTooLarge):
+            await read_body_within(request, 4096)
+
+    @pytest.mark.asyncio
+    async def test_body_at_the_limit_is_returned_whole(self):
+        request = _StubRequest({"content-length": "8192"}, [b"a" * 4096, b"b" * 4096])
+        assert await read_body_within(request, 8192) == b"a" * 4096 + b"b" * 4096
 
 
 class TestSessionCheck:
@@ -675,6 +771,37 @@ def _is_test_client_request_line(record: logging.LogRecord) -> bool:
     """The suite's own TestClient logs each request URL it sends, including the
     simulated Moneta redirect's query string. That is the harness, not the service."""
     return record.name == "httpx" and "http://testserver/" in record.getMessage()
+
+
+class TestRevalidationErrorHandling:
+    def test_unexpected_error_from_the_refresh_call_is_not_swallowed(self, redis_store, clock, monkeypatch):
+        token = _signed_in(redis_store, clock)
+        monkeypatch.setattr(m, "_post_refresh_grant", AsyncMock(side_effect=TypeError("bug")))
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        with pytest.raises(TypeError):
+            _session(token)
+
+    def test_unexpected_error_from_the_corporate_check_is_not_swallowed(
+        self, redis_store, clock, monkeypatch, fake_token_endpoint
+    ):
+        token = _signed_in(redis_store, clock)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _idp_refresh_response())
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        with patch("main._validate_corporate_id", side_effect=TypeError("bug")), pytest.raises(TypeError):
+            _session(token)
+
+    def test_jwt_error_in_the_corporate_check_keeps_the_session(
+        self, redis_store, clock, monkeypatch, fake_token_endpoint
+    ):
+        token = _signed_in(redis_store, clock)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _idp_refresh_response())
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        with patch("main._validate_corporate_id", side_effect=pyjwt.InvalidTokenError("clock skew")):
+            assert _session(token).status_code == 200
+        assert session_key(token) in redis_store.values
 
 
 class TestCredentialsNeverLogged:

@@ -13,6 +13,7 @@ from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .bodies import RequestTooLarge, read_body_within
 from .config import AdapterConfig
 from .responses import (
     adapter_json,
@@ -22,6 +23,7 @@ from .responses import (
     session_expired,
     session_required,
 )
+from .sealing import LOGIN_CODE_REFRESH_TOKEN, seal, unseal
 from .sessions import (
     Identity,
     IdentityProvider,
@@ -171,7 +173,7 @@ class NipFaAdapter:
         record = {
             "handoff_challenge": bridge_data["handoff_challenge"],
             "identity": asdict(identity),
-            "refresh_token": refresh_token,
+            "sealed_refresh_token": seal(code, refresh_token, LOGIN_CODE_REFRESH_TOKEN),
         }
         await self._gateway.redis().setex(_code_key(code), CODE_TTL_SECONDS, json.dumps(record))
         logger.info("nip-fa: login code issued for mpass_id=%s", mpass_id)
@@ -180,8 +182,9 @@ class NipFaAdapter:
     async def exchange_code(self, request: Request) -> Response:
         if request.headers.get("content-encoding"):
             return invalid_request()
-        raw = await request.body()
-        if len(raw) > MAX_EXCHANGE_BODY_BYTES:
+        try:
+            raw = await read_body_within(request, MAX_EXCHANGE_BODY_BYTES)
+        except RequestTooLarge:
             return request_too_large()
         exchange = parse_exchange_body(raw)
         if exchange is None:
@@ -196,9 +199,13 @@ class NipFaAdapter:
         if not challenge_matches(exchange.handoff_secret, record["handoff_challenge"]):
             logger.warning("nip-fa: handoff secret mismatch for mpass_id=%s; code burned", identity.sub)
             return invalid_request()
+        refresh_token = unseal(exchange.code, record["sealed_refresh_token"], LOGIN_CODE_REFRESH_TOKEN)
+        if refresh_token is None:
+            logger.error("nip-fa: login code record failed to unseal for mpass_id=%s", identity.sub)
+            return invalid_request()
 
         session_token, session = await self.sessions.open(
-            identity, record["refresh_token"], self._config.session_ttl_seconds
+            identity, refresh_token, self._config.session_ttl_seconds
         )
         logger.info("nip-fa: session opened for mpass_id=%s", identity.sub)
         return adapter_json({"session_token": session_token, **session_view(session)})

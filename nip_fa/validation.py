@@ -6,11 +6,12 @@ import hmac
 import json
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "[::1]"})
 SUPPORTED_CHALLENGE_METHOD = "S256"
 EXCHANGE_FIELDS = frozenset({"code", "handoff_secret"})
+RESERVED_CALLBACK_PARAMS = frozenset({"code", "error", "error_description"})
 
 _PORT_PATTERN = re.compile(r"[1-9][0-9]{0,4}")
 _SHA256_B64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -46,19 +47,28 @@ def challenge_matches(handoff_secret: str, handoff_challenge: str) -> bool:
 
 def is_loopback_callback(return_to: str) -> bool:
     """RFC 8252 §7.3 loopback redirect: `http`, an exact loopback IP literal,
-    an explicit port, no userinfo and no fragment."""
-    if _FORBIDDEN_URL_CHARACTERS.search(return_to):
+    an explicit port, no userinfo, no fragment, and no query parameter the
+    adapter itself appends."""
+    if _FORBIDDEN_URL_CHARACTERS.search(return_to) or "#" in return_to:
         return False
     if not return_to.startswith("http://"):
         return False
-    parts = urlsplit(return_to)
+    try:
+        parts = urlsplit(return_to)
+    except ValueError:
+        return False
     host, separator, port = parts.netloc.rpartition(":")
     return (
         bool(separator)
         and host in LOOPBACK_HOSTS
         and _is_valid_port(port)
-        and "#" not in return_to
+        and not _has_reserved_param(parts.query)
     )
+
+
+def _has_reserved_param(query: str) -> bool:
+    names = {name for name, _ in parse_qsl(query, keep_blank_values=True)}
+    return not names.isdisjoint(RESERVED_CALLBACK_PARAMS)
 
 
 def _is_valid_port(port: str) -> bool:
@@ -111,6 +121,11 @@ def _is_non_empty_ascii(value: object) -> bool:
 
 
 def with_query_params(url: str, params: dict[str, str]) -> str:
-    parts = urlsplit(url)
-    query = urlencode([*parse_qsl(parts.query, keep_blank_values=True), *params.items()])
-    return urlunsplit(parts._replace(query=query))
+    """`url` byte for byte with `params` appended. `url` must carry no fragment."""
+    return url + _query_separator(url) + urlencode(params)
+
+
+def _query_separator(url: str) -> str:
+    if "?" not in url:
+        return "?"
+    return "" if url.endswith(("?", "&")) else "&"
