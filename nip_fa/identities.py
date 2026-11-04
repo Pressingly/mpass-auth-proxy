@@ -23,7 +23,13 @@ _BIND_SQL = (
     "ON CONFLICT (sub) DO NOTHING"
 )
 _READ_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1"
-_DATABASE_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
+_DATABASE_ERRORS = (
+    asyncpg.PostgresError,
+    asyncpg.InterfaceError,
+    asyncpg.InternalClientError,
+    OSError,
+    TimeoutError,
+)
 
 
 class IdentityStoreUnavailable(Exception):
@@ -108,17 +114,25 @@ class IdentityKeyService:
             logger.warning("nip-fa: identity key unavailable for mpass_id=%s", identity.sub)
             return KeyIssuance(KeyIssuanceStatus.UNAVAILABLE)
         status = issuance_status(keypair.pubkey_hex, stored)
-        _log_outcome(identity.sub, keypair.pubkey_hex, status)
+        _log_outcome(identity.sub, keypair.pubkey_hex, status, stored)
         if status is not KeyIssuanceStatus.ISSUED:
             return KeyIssuance(status)
         return KeyIssuance(status, keypair)
 
 
-def _log_outcome(mpass_id: str, pubkey_hex: str, status: KeyIssuanceStatus) -> None:
+def _log_outcome(
+    mpass_id: str, pubkey_hex: str, status: KeyIssuanceStatus, stored: StoredIdentity | None
+) -> None:
     if status is KeyIssuanceStatus.ISSUED:
         logger.info("nip-fa: identity key issued mpass_id=%s pubkey=%s", mpass_id, pubkey_hex)
     elif status is KeyIssuanceStatus.REVOKED:
         logger.warning("nip-fa: identity key refused mpass_id=%s reason=revoked", mpass_id)
+    elif stored is None:
+        logger.error(
+            "nip-fa: identity key refused mpass_id=%s reason=pubkey_bound_to_other_sub; the derived "
+            "key is already bound to another mPass ID in buzz_identities",
+            mpass_id,
+        )
     else:
         logger.error(
             "nip-fa: identity key refused mpass_id=%s reason=binding_mismatch; the stored key "

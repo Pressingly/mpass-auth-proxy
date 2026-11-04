@@ -69,7 +69,8 @@ The Buzz NIP-FA adapter (`BUZZ_ADAPTER_ENABLED`, off by default) requires
 refuses to start with the flag on and any of the three missing or malformed.
 
 Each user's Nostr key is
-`HKDF-SHA256(ikm=master secret, salt=identity salt, info="moneta-buzz/nostr-key/v1|" + mPass ID)`,
+`HKDF-SHA256(ikm=master secret, salt=identity salt, info="moneta-buzz/nostr-key/v1|" + uint16_be(len(mPass ID)) + mPass ID + attempt byte)`,
+where the attempt byte is 0 unless that scalar is out of range for secp256k1,
 so changing either value re-keys every Buzz user. The first issuance binds the
 public key in launchpad's `buzz_identities` table; a later derivation that no
 longer matches it is refused with `binding_mismatch` rather than issuing a new

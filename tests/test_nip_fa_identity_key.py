@@ -19,7 +19,9 @@ from nip_fa.identities import (
 from nip_fa.identity_keys import (
     SECP256K1_ORDER,
     KeyDerivationError,
+    MAX_MPASS_ID_BYTES,
     NostrKeypair,
+    derivation_info,
     derive_keypair,
     is_valid_scalar,
     xonly_pubkey_hex,
@@ -44,13 +46,18 @@ from tests.test_nip_fa_login import (  # noqa: F401  (fixtures apply by import)
 _VECTOR_MASTER = bytes.fromhex("11" * 32)
 _VECTOR_SALT = bytes.fromhex("22" * 16)
 _VECTOR_MPASS_ID = "mpass-id-1234"
-_VECTOR_SECRET_HEX = "26a7e427e794f0c376860988503785ad6cf7a526e7ae2930db91ccbf4bc142af"
-_VECTOR_PUBKEY_HEX = "357e48fe2f74a2cdcc3adfd26051d0411cca6668562973c5370869ac538c420e"
+_VECTOR_SECRET_HEX = "f44458a6538d7532a7c744175e9d253c6d0cfd5d3964554bebf8cbd5a17d7ef4"
+_VECTOR_PUBKEY_HEX = "f7472b62ab0cba8a024d455b1991f01e7268e439fbd74552ed890f137dc94894"
 
 
 def _rfc5869_hkdf_sha256(ikm: bytes, salt: bytes, info: bytes) -> bytes:
     prk = hmac.new(salt, ikm, hashlib.sha256).digest()
     return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+
+def _documented_info(mpass_id: str, attempt: int) -> bytes:
+    encoded = mpass_id.encode("utf-8")
+    return b"moneta-buzz/nostr-key/v1|" + len(encoded).to_bytes(2, "big") + encoded + bytes([attempt])
 
 
 class TestKeyDerivation:
@@ -59,10 +66,18 @@ class TestKeyDerivation:
         assert keypair == NostrKeypair(_VECTOR_SECRET_HEX, _VECTOR_PUBKEY_HEX)
 
     def test_follows_the_documented_formula(self):
-        expected = _rfc5869_hkdf_sha256(
-            _VECTOR_MASTER, _VECTOR_SALT, b"moneta-buzz/nostr-key/v1|" + _VECTOR_MPASS_ID.encode()
-        )
+        expected = _rfc5869_hkdf_sha256(_VECTOR_MASTER, _VECTOR_SALT, _documented_info(_VECTOR_MPASS_ID, 0))
         assert derive_keypair(_VECTOR_MASTER, _VECTOR_SALT, _VECTOR_MPASS_ID).secret_key_hex == expected.hex()
+
+    def test_info_framing_is_unambiguous(self):
+        assert derivation_info("abc", 1) != derivation_info("abc\x01", 0)
+        assert derivation_info("abc", 0) != derivation_info("ab", 0)
+        assert derivation_info("abc", 0) == b"moneta-buzz/nostr-key/v1|\x00\x03abc\x00"
+
+    def test_mpass_id_length_is_bounded(self):
+        assert derivation_info("a" * MAX_MPASS_ID_BYTES, 0)
+        with pytest.raises(KeyDerivationError):
+            derivation_info("a" * (MAX_MPASS_ID_BYTES + 1), 0)
 
     def test_pubkey_is_the_bip340_xonly_key(self):
         assert xonly_pubkey_hex((3).to_bytes(32, "big")) == (
@@ -98,9 +113,7 @@ class TestKeyDerivation:
         keypair = derive_keypair(_VECTOR_MASTER, _VECTOR_SALT, _VECTOR_MPASS_ID)
 
         assert attempts == [0, 1, 2]
-        expected = _rfc5869_hkdf_sha256(
-            _VECTOR_MASTER, _VECTOR_SALT, b"moneta-buzz/nostr-key/v1|" + _VECTOR_MPASS_ID.encode() + b"\x02"
-        )
+        expected = _rfc5869_hkdf_sha256(_VECTOR_MASTER, _VECTOR_SALT, _documented_info(_VECTOR_MPASS_ID, 2))
         assert keypair.secret_key_hex == expected.hex()
         assert keypair == derive_keypair(_VECTOR_MASTER, _VECTOR_SALT, _VECTOR_MPASS_ID)
 
@@ -204,11 +217,17 @@ class TestIdentityKeyEndpoint:
 
         assert _identity_key(token).json() == {"error": "binding_mismatch"}
 
-    def test_key_bound_to_someone_else_fails_closed(self, redis_store, clock, identity_store):
+    def test_key_bound_to_someone_else_fails_closed(self, redis_store, clock, identity_store, caplog):
         token = _signed_in(redis_store, clock)
         identity_store.rows["another-mpass-id"] = StoredIdentity(_expected_keypair().pubkey_hex, revoked=False)
 
-        assert _identity_key(token).json() == {"error": "binding_mismatch"}
+        with caplog.at_level(logging.INFO):
+            assert _identity_key(token).json() == {"error": "binding_mismatch"}
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert f"mpass_id={_MPASS_ID} reason=pubkey_bound_to_other_sub" in errors[0]
+        assert "another-mpass-id" not in errors[0]
 
     def test_store_outage_is_issuance_unavailable(self, redis_store, clock, identity_store):
         token = _signed_in(redis_store, clock)
@@ -382,6 +401,7 @@ class TestLaunchpadIdentityStore:
     @pytest.mark.parametrize("error", [
         asyncpg.UndefinedTableError("no buzz_identities"),
         asyncpg.InsufficientPrivilegeError("no grant"),
+        asyncpg.InternalClientError("protocol state"),
         ConnectionResetError(),
         TimeoutError(),
     ])
@@ -404,3 +424,15 @@ class TestLaunchpadIdentityStore:
 
         with pytest.raises(IdentityStoreUnavailable):
             await store.ensure_identity("sub-1", "ab" * 32, None)
+
+
+class TestLaunchpadOutageLog:
+    @pytest.mark.parametrize("capture_on, expected", [
+        (True, "ALL token exchanges and session refreshes will return 503"),
+        (False, "Buzz identity keys will return 503"),
+    ])
+    def test_names_the_real_impact(self, monkeypatch, capture_on, expected):
+        monkeypatch.setattr(m, "_EMAIL_CAPTURE_ENABLED", capture_on)
+        impact = m._launchpad_outage_impact()
+        assert impact.startswith(expected)
+        assert ("ALL token exchanges" in impact) is capture_on

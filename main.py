@@ -508,6 +508,12 @@ class EmailOverlayUnavailable(Exception):
     """
 
 
+def _launchpad_outage_impact() -> str:
+    if _EMAIL_CAPTURE_ENABLED:
+        return "ALL token exchanges and session refreshes will return 503"
+    return "Buzz identity keys will return 503 (email capture is off, so logins are unaffected)"
+
+
 async def _get_launchpad_pool() -> asyncpg.Pool:
     global _launchpad_pool, _launchpad_pool_failed_at
     if _launchpad_pool is not None:
@@ -535,13 +541,13 @@ async def _get_launchpad_pool() -> asyncpg.Pool:
         except Exception as exc:
             _launchpad_pool_failed_at = datetime.now(UTC)
             # ERROR, not warning, and once per cooldown window rather than per
-            # request: while this is failing every /token exchange and every
-            # session refresh returns 503 platform-wide, and /health cannot see
-            # it -- it is a static 200 that touches neither the pool nor the IdP.
+            # request: with email capture on, every /token exchange and every
+            # session refresh returns 503 platform-wide while this fails, and
+            # /health cannot see it -- it is a static 200 that touches neither
+            # the pool nor the IdP.
             logger.error(
-                "launchpad pool unavailable — ALL token exchanges and session "
-                "refreshes will return 503 until this recovers. %s: %s",
-                type(exc).__name__, exc,
+                "launchpad pool unavailable — %s until this recovers. %s: %s",
+                _launchpad_outage_impact(), type(exc).__name__, exc,
             )
             raise
         _launchpad_pool_failed_at = None
