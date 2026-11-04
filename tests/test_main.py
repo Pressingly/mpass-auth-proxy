@@ -1059,6 +1059,46 @@ class TestRefreshCoalescing:
         assert len(idp.posts) == 1
 
     @pytest.mark.asyncio
+    async def test_unexpected_error_reaches_every_waiter_as_502(self, gated_idp, caplog):
+        caplog.set_level(logging.INFO, logger="main")
+        idp = gated_idp()
+        tasks = _start_refreshes(*["same.refresh"] * 3)
+        await _settle()
+        with patch("main._validate_corporate_id", new=AsyncMock(side_effect=InvalidTokenError("bad"))):
+            idp.gate.set()
+            responses = await asyncio.gather(*tasks)
+
+        assert [r.status_code for r in responses] == [502, 502, 502]
+        assert all(r.body == b"Token refresh failed" for r in responses)
+        assert len(idp.posts) == 1
+        assert m._refreshes_in_flight == {}
+        token_ref = hashlib.sha256(b"same.refresh").hexdigest()[:8]
+        unexpected = [
+            r for r in caplog.records
+            if r.getMessage() == f"bridge_token refresh: unexpected error token={token_ref}: InvalidTokenError"
+        ]
+        assert len(unexpected) == 1
+        assert unexpected[0].exc_info is not None
+
+    @pytest.mark.asyncio
+    async def test_unexpected_error_after_every_waiter_left_is_still_retrieved(
+        self, gated_idp, caplog,
+    ):
+        idp = gated_idp()
+        tasks = _start_refreshes(*["same.refresh"] * 2)
+        await _settle()
+        shared = m._refreshes_in_flight[m._refresh_key("same.refresh")]
+        for task in tasks:
+            task.cancel()
+        await _settle()
+        with patch("main._validate_corporate_id", new=AsyncMock(side_effect=KeyError("x"))):
+            idp.gate.set()
+            outcome = await shared
+
+        assert outcome.status_code == 502
+        assert m._refreshes_in_flight == {}
+
+    @pytest.mark.asyncio
     async def test_cancelling_the_first_caller_does_not_fail_the_others(self, gated_idp):
         idp = gated_idp()
         first, *others = _start_refreshes(*["same.refresh"] * 3)
@@ -1077,27 +1117,37 @@ class TestRefreshCoalescing:
         assert m._refreshes_in_flight == {}
 
 
+_R_REF = hashlib.sha256(b"r").hexdigest()[:8]
+
+
 def _refresh_log_lines(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if "bridge_token refresh" in r.getMessage()]
 
 
 class TestRefreshClientLabel:
-    def test_oauth2_proxy_form_is_browser(self):
-        assert m._refresh_client_label({"grant_type", "refresh_token"}, "") == "browser"
-
-    def test_fastmcp_form_is_mcp_with_its_client_id(self):
-        keys = {"grant_type", "refresh_token", "scope", "client_id"}
-        assert m._refresh_client_label(keys, "abc-123_x.y") == "mcp:abc-123_x.y"
+    @pytest.mark.parametrize(
+        ("form_keys", "client_id", "label"),
+        [
+            ({"grant_type", "refresh_token"}, "", "browser"),
+            (
+                {"grant_type", "refresh_token", "client_id", "client_secret"},
+                "proxy-client",
+                "browser:proxy-client",
+            ),
+            ({"grant_type", "refresh_token", "scope", "client_id"}, "abc-123_x.y", "mcp:abc-123_x.y"),
+            ({"grant_type", "refresh_token", "scope"}, "", "mcp"),
+        ],
+        ids=["oauth2-proxy", "oauth2-proxy-params-retry", "fastmcp-post", "fastmcp-basic-auth"],
+    )
+    def test_real_form_shapes(self, form_keys, client_id, label):
+        assert m._refresh_client_label(form_keys, client_id) == label
 
     def test_client_id_cannot_inject_log_lines(self):
-        keys = {"grant_type", "refresh_token", "client_id"}
+        keys = {"grant_type", "refresh_token", "scope", "client_id"}
         label = m._refresh_client_label(keys, "evil\nINFO forged line" + "x" * 100)
         assert "\n" not in label
         assert " " not in label
         assert len(label) == len("mcp:") + 64
-
-    def test_unrecognised_form_is_other(self):
-        assert m._refresh_client_label({"grant_type", "refresh_token", "scope"}, "") == "other"
 
 
 class TestRefreshLogFields:
@@ -1115,9 +1165,16 @@ class TestRefreshLogFields:
         idp.gate.set()
         await asyncio.gather(leader, joiner)
 
+        token_ref = hashlib.sha256(b"same.refresh").hexdigest()[:8]
         lines = _refresh_log_lines(caplog)
-        assert "bridge_token refresh: issued new tokens sub=u client=mcp:abc role=led" in lines
-        assert "bridge_token refresh: issued new tokens sub=u client=browser role=joined" in lines
+        assert (
+            f"bridge_token refresh: issued new tokens sub=u token={token_ref} client=mcp:abc role=led"
+            in lines
+        )
+        assert (
+            f"bridge_token refresh: issued new tokens sub=u token={token_ref} client=browser role=joined"
+            in lines
+        )
         assert not any("same.refresh" in line for line in lines)
 
     @pytest.mark.asyncio
@@ -1145,6 +1202,7 @@ class TestRefreshLogFields:
         [
             ({}, "browser"),
             ({"scope": "openid", "client_id": "fastmcp-client"}, "mcp:fastmcp-client"),
+            ({"scope": "openid"}, "mcp"),
         ],
     )
     def test_bridge_token_tags_the_requesting_client(
@@ -1164,7 +1222,7 @@ class TestRefreshLogFields:
 
         assert response.status_code == 200
         assert (
-            f"bridge_token refresh: issued new tokens sub=u client={label} role=led"
+            f"bridge_token refresh: issued new tokens sub=u token={_R_REF} client={label} role=led"
             in _refresh_log_lines(caplog)
         )
 

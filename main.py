@@ -1054,18 +1054,17 @@ def _token_ref(refresh_token: str) -> str:
     return _refresh_key(refresh_token)[:8]
 
 
-_BROWSER_REFRESH_FORM_KEYS = frozenset({"grant_type", "refresh_token"})
 _UNSAFE_LOG_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _refresh_client_label(form_keys: set[str], client_id: str) -> str:
-    """oauth2-proxy sends only the grant and the token; FastMCP's OAuth proxy
-    also sends scope and its public client_id."""
-    if form_keys == _BROWSER_REFRESH_FORM_KEYS:
-        return "browser"
-    if client_id:
-        return f"mcp:{_UNSAFE_LOG_CHARS.sub('?', client_id)[:64]}"
-    return "other"
+    """FastMCP's OAuth proxy sends scope on refresh and oauth2-proxy never does.
+    client_id is no signal on its own: oauth2-proxy may retry with credentials
+    in the body, and authlib may send them as basic auth instead."""
+    client_type = "mcp" if "scope" in form_keys else "browser"
+    if not client_id:
+        return client_type
+    return f"{client_type}:{_UNSAFE_LOG_CHARS.sub('?', client_id)[:64]}"
 
 
 def _forget_refresh(key: str, task: asyncio.Task[_TokenOutcome]) -> None:
@@ -1092,8 +1091,8 @@ def _log_refresh_result(
 ) -> None:
     if outcome.status_code == 200:
         logger.info(
-            "bridge_token refresh: issued new tokens sub=%s client=%s role=%s",
-            outcome.sub, client, role,
+            "bridge_token refresh: issued new tokens sub=%s token=%s client=%s role=%s",
+            outcome.sub, _token_ref(refresh_token), client, role,
         )
         return
     logger.warning(
@@ -1118,6 +1117,19 @@ def _id_token_sub(id_token: str) -> str | None:
 
 
 async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
+    """Every waiter shares this outcome, so nothing may escape it as an
+    exception: each waiter would re-raise the same object and none would log."""
+    try:
+        return await _exchange_refresh_token(refresh_token)
+    except Exception as exc:
+        logger.exception(
+            "bridge_token refresh: unexpected error token=%s: %s",
+            _token_ref(refresh_token), type(exc).__name__,
+        )
+        return _TokenOutcome(502, "Token refresh failed")
+
+
+async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
     token_ref = _token_ref(refresh_token)
     payload: dict = {
         "grant_type": "refresh_token",
