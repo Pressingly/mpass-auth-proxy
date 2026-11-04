@@ -26,6 +26,8 @@ import uuid as _uuid
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
+import nip_fa
+
 # Configure the root logger. uvicorn's --log-level only configures uvicorn's own
 # loggers ("uvicorn", "uvicorn.error", "uvicorn.access"); this module's logger
 # propagates to root, which otherwise has no handler and falls back to
@@ -133,6 +135,8 @@ def _derive_portal_url() -> str:
     return f"{parsed.scheme}://{host}/"
 
 PORTAL_URL: str = _derive_portal_url()
+
+_BUZZ_ADAPTER_CONFIG: nip_fa.AdapterConfig = nip_fa.AdapterConfig.from_env(os.environ)
 
 # ---------------------------------------------------------------------------
 # App + Redis
@@ -574,6 +578,22 @@ async def _apply_email_overlay(claims: dict) -> dict:
     on that claim -- so a one-second database hiccup silently turns one human
     into two principals, intermittently. A 503 is recoverable; a split identity
     is not."""
+    synthetic_id, real_email = await _lookup_verified_email(claims)
+    new_claims = dict(claims)
+    new_claims["preferred_username"] = synthetic_id
+    if real_email:
+        new_claims["email"] = real_email
+        logger.info("overlay: applied real_email for sid=%s", synthetic_id)
+    else:
+        new_claims["email"] = f"{synthetic_id}@{_SYNTHETIC_EMAIL_DOMAIN}"
+        logger.info("overlay: set synthetic email for sid=%s", synthetic_id)
+    return new_claims
+
+
+async def _lookup_verified_email(claims: dict) -> tuple[str, str | None]:
+    """(synthetic_id, the user's verified real email or None when there is no
+    verified row). Raises EmailOverlayUnavailable when the answer is unknown,
+    for the reasons given on _apply_email_overlay."""
     # cognito:username only. The `sub` fallback that used to sit here mixed two
     # claim namespaces in a single keyspace with nothing recording which one a
     # given row came from, so two users from different claim sources could
@@ -602,15 +622,7 @@ async def _apply_email_overlay(claims: dict) -> dict:
             synthetic_id, type(exc).__name__, exc,
         )
         raise EmailOverlayUnavailable(str(exc)) from exc
-    new_claims = dict(claims)
-    new_claims["preferred_username"] = synthetic_id
-    if real_email:
-        new_claims["email"] = real_email
-        logger.info("overlay: applied real_email for sid=%s", synthetic_id)
-    else:
-        new_claims["email"] = f"{synthetic_id}@{_SYNTHETIC_EMAIL_DOMAIN}"
-        logger.info("overlay: set synthetic email for sid=%s", synthetic_id)
-    return new_claims
+    return synthetic_id, real_email
 
 
 # ---------------------------------------------------------------------------
@@ -823,12 +835,17 @@ async def bridge_authorize(request: Request) -> Response:
     if not parsed.netloc or not parsed.netloc.endswith(_PLATFORM_DOMAIN_SUFFIX):
         return Response(status_code=400, content="Invalid redirect_uri")
 
-    bridge_data = json.dumps({
+    return await _begin_moneta_login(state, {
         "redirect_uri": redirect_uri,
         "state": state,
         "code_challenge": code_challenge,
     })
-    await redis_client.setex(f"bridge_state:{state}", BRIDGE_STATE_TTL, bridge_data)
+
+
+async def _begin_moneta_login(state: str, bridge_data: dict) -> Response:
+    """Park the flow's bridge state under `state` and send the browser to the
+    Moneta hosted UI; /mpass-callback resumes it from the mpass_bridge cookie."""
+    await redis_client.setex(f"bridge_state:{state}", BRIDGE_STATE_TTL, json.dumps(bridge_data))
 
     response = RedirectResponse(url=_moneta_login_url(), status_code=302)
     response.set_cookie(
@@ -879,6 +896,10 @@ async def _bridge_callback_impl(request: Request) -> Response:
     except json.JSONDecodeError:
         return Response(status_code=500, content="Corrupt bridge state")
 
+    if not _is_buzz_login(bridge_data) and not _is_oauth2_bridge_state(bridge_data):
+        logger.info("mpass-callback: bridge state belongs to no enabled flow — redirecting to portal")
+        return _portal_redirect_with_error("expired_flow")
+
     try:
         jwks = await _get_jwks()
         header = jwt.get_unverified_header(id_token)
@@ -913,7 +934,12 @@ async def _bridge_callback_impl(request: Request) -> Response:
         await _validate_corporate_id(access_token)
     except CorporateIdMismatch as exc:
         logger.warning("bridge_callback: corporate-id check failed: %s", exc)
+        if _is_buzz_login(bridge_data):
+            return _buzz_adapter.deny_login(bridge_data, "access_denied", exc.reason or None)
         return _portal_redirect_with_error("access_denied", reason=exc.reason)
+
+    if _is_buzz_login(bridge_data):
+        return await _buzz_adapter.complete_login(bridge_data, claims, refresh_token)
 
     if not refresh_token:
         logger.warning("bridge_callback: Moneta did not provide refresh_token — session refresh will not work")
@@ -1122,8 +1148,10 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
         return _TokenOutcome(502, "Token refresh failed")
 
 
-async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
-    token_ref = _token_ref(refresh_token)
+async def _post_refresh_grant(refresh_token: str) -> httpx.Response:
+    """POST a refresh_token grant to the IdP's token endpoint. Shared by the
+    oauth2-proxy refresh path and the Buzz adapter's session revalidation, so
+    both make the identical IdP call."""
     payload: dict = {
         "grant_type": "refresh_token",
         "client_id": OIDC_CLIENT_ID,
@@ -1132,14 +1160,20 @@ async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
     if OIDC_CLIENT_SECRET:
         payload["client_secret"] = OIDC_CLIENT_SECRET
 
+    token_url = await _get_token_endpoint()
+    async with httpx.AsyncClient(timeout=_IDP_REFRESH_TIMEOUT_SECONDS) as client:
+        return await client.post(
+            token_url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+
+async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
+    token_ref = _token_ref(refresh_token)
+
     try:
-        token_url = await _get_token_endpoint()
-        async with httpx.AsyncClient(timeout=_IDP_REFRESH_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                token_url,
-                data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+        resp = await _post_refresh_grant(refresh_token)
     except httpx.HTTPError as exc:
         logger.error(
             "bridge_token refresh: IdP request failed token=%s: %s: %s",
@@ -1205,3 +1239,64 @@ async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
         "refresh_token": token_body.get("refresh_token") or refresh_token,
     }
     return _json_outcome(body, sub=_id_token_sub(token_body["id_token"]))
+
+
+# ---------------------------------------------------------------------------
+# Buzz NIP-FA adapter (see nip_fa/__init__.py)
+# ---------------------------------------------------------------------------
+
+
+class _PlatformGateway:
+    """nip_fa.PlatformGateway over this module. Names resolve at call time, so
+    the adapter always uses the same Redis client and helpers as the routes."""
+
+    def redis(self):
+        return redis_client
+
+    async def begin_moneta_login(self, state: str, bridge_data: dict) -> Response:
+        return await _begin_moneta_login(state, bridge_data)
+
+    async def resolve_email(self, claims: dict) -> str | None:
+        if not _EMAIL_CAPTURE_ENABLED:
+            return claims.get("email")
+        try:
+            _, verified_email = await _lookup_verified_email(claims)
+        except EmailOverlayUnavailable as exc:
+            raise nip_fa.IdentityUnavailable() from exc
+        if not verified_email:
+            raise nip_fa.EmailVerificationRequired()
+        return verified_email
+
+    async def refresh_grant(self, refresh_token: str) -> httpx.Response:
+        try:
+            await _get_token_endpoint()
+        except (KeyError, ValueError) as exc:
+            raise nip_fa.IdpUnavailable("OIDC discovery document is unusable") from exc
+        return await _post_refresh_grant(refresh_token)
+
+    async def corporate_id_allowed(self, access_token: str) -> bool:
+        try:
+            await _validate_corporate_id(access_token)
+        except CorporateIdMismatch as exc:
+            logger.warning("nip-fa: corporate-id check failed: reason=%s", exc.reason or "mismatch")
+            return False
+        return True
+
+
+_buzz_adapter: nip_fa.NipFaAdapter | None = (
+    nip_fa.NipFaAdapter(_BUZZ_ADAPTER_CONFIG, _PlatformGateway())
+    if _BUZZ_ADAPTER_CONFIG.enabled
+    else None
+)
+if _buzz_adapter is not None:
+    app.include_router(_buzz_adapter.router)
+
+
+def _is_buzz_login(bridge_data: dict) -> bool:
+    return _buzz_adapter is not None and _buzz_adapter.owns(bridge_data)
+
+
+def _is_oauth2_bridge_state(bridge_data: dict) -> bool:
+    return "flow" not in bridge_data and all(
+        bridge_data.get(field) for field in ("redirect_uri", "state", "code_challenge")
+    )

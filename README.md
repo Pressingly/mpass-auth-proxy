@@ -23,6 +23,9 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/mpass/login` | Redirects to `/oauth2/sign_in` — re-initiates SSO after a 401 |
 | `GET`  | `/mpass/logout` | Clears the `mpass_bridge` cookie, then `302` to `/oauth2/sign_out`, optionally chaining through the IdP sign-out |
 | `GET`  | `/health` | Liveness check |
+| `GET`  | `/nip-fa/v1/login/start` | Buzz NIP-FA browser login: validates the loopback `return_to` and S256 handoff challenge, then joins the Moneta login (only when `BUZZ_ADAPTER_ENABLED`) |
+| `POST` | `/nip-fa/v1/login/exchange` | Buzz NIP-FA code exchange: single-use code + handoff secret for an adapter session |
+| `GET`  | `/nip-fa/v1/session` | Buzz NIP-FA session check (Bearer adapter session), revalidated against Cognito at most hourly |
 
 ### Traefik routing — cross-repo invariant
 
@@ -35,7 +38,9 @@ so auth breaks silently rather than erroring.
 The router rule does **not** live in this repository. It is the
 `traefik.http.routers.mpass-bridge.rule` label on the `mpass-auth-proxy` service
 in `docker-compose.yml` in `Pressingly/foss-server-bundle` (private), and it
-currently lists exactly the six paths in the table above.
+currently lists exactly the six non-`/nip-fa/` paths in the table above. Every
+Buzz adapter route lives under `/nip-fa/` (see `nip_fa/`), so the rule needs one
+`PathPrefix(`/nip-fa/`)` for all of them rather than a `Path()` per route.
 
 So adding, renaming or removing a route here is a **two-repo change**: land the
 route in this repo, then open a coordinated PR against foss-server-bundle
@@ -55,6 +60,11 @@ Required: `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `MONETA_HOSTED_UI_URL`,
 Optional: `OIDC_CLIENT_SECRET`, `SESSION_COOKIE_MAX_AGE_SECONDS`,
 `OIDC_LOGOUT_URI`, `LOGOUT_REDIRECT_URL`, `SMB_CORPORATE_ID`, `PORTAL_URL`,
 `LOG_LEVEL`.
+
+The Buzz NIP-FA adapter (`BUZZ_ADAPTER_ENABLED`, off by default) requires
+`BUZZ_IDENTITY_MASTER_SECRET` (64 hex characters) and reads the optional
+`BUZZ_ADAPTER_SESSION_TTL_SECONDS` (default 2592000, 30 days). The service
+refuses to start with the flag on and the secret missing or malformed.
 
 Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
 the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),
