@@ -1842,7 +1842,8 @@ class TestEmailCaptureDisabled:
     def test_jwks_endpoint_404s_when_disabled(self):
         """Serving a key set while oauth2-proxy trusts the IdP would be worse
         than 404: verification would fail with no indication why."""
-        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False):
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False), \
+             patch.object(m, "_BUZZ_ADAPTER_CONFIG", m.nip_fa.AdapterConfig(enabled=False)):
             response = client.get("/.well-known/jwks.json")
         assert response.status_code == 404
         assert "not the token signer" in response.json()["detail"]

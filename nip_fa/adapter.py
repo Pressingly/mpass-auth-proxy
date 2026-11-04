@@ -1,10 +1,10 @@
-"""NIP-FA browser login, code exchange and session check."""
+"""NIP-FA browser login, code exchange, session check, identity key and relay assertion."""
 
 import hashlib
 import logging
 import secrets
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Protocol
 
 import asyncpg
@@ -13,6 +13,17 @@ from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .assertions import (
+    MAX_ASSERTION_BODY_BYTES,
+    AssertionRateLimiter,
+    AssertionRequest,
+    RateLimiterUnavailable,
+    SigningKey,
+    assertion_claims,
+    assertion_expiry,
+    parse_assertion_body,
+    sign_assertion,
+)
 from .bodies import RequestTooLarge, read_body_within
 from .config import AdapterConfig
 from .identities import (
@@ -22,13 +33,16 @@ from .identities import (
     KeyIssuanceStatus,
     LaunchpadIdentityStore,
 )
+from .nip98 import ExpectedRequest, ProofFailure, verify_http_auth
 from .responses import (
     adapter_json,
     adapter_redirect,
     authorization_denied,
     binding_mismatch,
+    invalid_proof,
     invalid_request,
     issuance_unavailable,
+    rate_limited,
     request_too_large,
     session_expired,
     session_required,
@@ -45,6 +59,7 @@ from .sessions import (
     SessionStore,
     rfc3339,
 )
+from .urls import relay_authority
 from .validation import challenge_matches, parse_exchange_body, parse_login_start, with_query_params
 
 logger = logging.getLogger(__name__)
@@ -53,6 +68,8 @@ ROUTE_PREFIX = "/nip-fa"
 FLOW_TAG = "nip-fa"
 CODE_TTL_SECONDS = 120
 MAX_EXCHANGE_BODY_BYTES = 4096
+ASSERTION_RATE_LIMIT = 30
+ASSERTION_RATE_WINDOW_SECONDS = 60
 _CODE_KEY_PREFIX = "nip_fa_code:"
 
 
@@ -78,6 +95,9 @@ class PlatformGateway(IdentityProvider, Protocol):
 
     async def launchpad_pool(self) -> asyncpg.Pool:
         """Raises IdentityStoreUnavailable when the launchpad database cannot be reached."""
+
+    def signing_key(self) -> SigningKey:
+        """The key that signs NIP-FI assertions, published at /.well-known/jwks.json."""
 
 
 def _code_key(code: str) -> str:
@@ -106,15 +126,48 @@ def session_view(session: Session) -> dict:
     return view
 
 
+_KEY_REFUSALS = {
+    KeyIssuanceStatus.REVOKED: authorization_denied,
+    KeyIssuanceStatus.BINDING_MISMATCH: binding_mismatch,
+    KeyIssuanceStatus.UNAVAILABLE: issuance_unavailable,
+}
+
+
+def _key_refusal(status: KeyIssuanceStatus) -> Response | None:
+    refusal = _KEY_REFUSALS.get(status)
+    return refusal() if refusal is not None else None
+
+
 def _issuance_response(issuance: KeyIssuance) -> Response:
-    if issuance.status is KeyIssuanceStatus.REVOKED:
-        return authorization_denied()
-    if issuance.status is KeyIssuanceStatus.BINDING_MISMATCH:
-        return binding_mismatch()
-    if issuance.status is KeyIssuanceStatus.UNAVAILABLE:
-        return issuance_unavailable()
+    refusal = _key_refusal(issuance.status)
+    if refusal is not None:
+        return refusal
     keypair = issuance.keypair
     return adapter_json({"nostr_pubkey": keypair.pubkey_hex, "secret_key": keypair.secret_key_hex})
+
+
+@dataclass(frozen=True)
+class _AssertionInput:
+    proof: str
+    raw_body: bytes
+    body: AssertionRequest
+
+    def __repr__(self) -> str:
+        return "_AssertionInput(<redacted>)"
+
+
+async def _read_assertion_input(request: Request) -> _AssertionInput | Response:
+    proofs = request.headers.getlist("nostr-authorization")
+    if len(proofs) != 1 or "content-encoding" in request.headers:
+        return invalid_request()
+    try:
+        raw = await read_body_within(request, MAX_ASSERTION_BODY_BYTES)
+    except RequestTooLarge:
+        return request_too_large()
+    body = parse_assertion_body(raw)
+    if body is None:
+        return invalid_request()
+    return _AssertionInput(proof=proofs[0], raw_body=raw, body=body)
 
 
 def _single_bearer_token(headers: Headers) -> tuple[str | None, Response | None]:
@@ -149,6 +202,9 @@ class NipFaAdapter:
             config.identity_salt,
             identity_store or LaunchpadIdentityStore(gateway.launchpad_pool),
         )
+        self.assertion_rate_limiter = AssertionRateLimiter(
+            gateway.redis, ASSERTION_RATE_LIMIT, ASSERTION_RATE_WINDOW_SECONDS
+        )
         self.router = self._build_router()
 
     def _build_router(self) -> APIRouter:
@@ -157,6 +213,7 @@ class NipFaAdapter:
         router.add_api_route("/v1/login/exchange", self.exchange_code, methods=["POST"])
         router.add_api_route("/v1/session", self.check_session, methods=["GET"])
         router.add_api_route("/v1/identity/key", self.issue_identity_key, methods=["GET"])
+        router.add_api_route("/v1/identity/assertions", self.issue_assertion, methods=["POST"])
         return router
 
     def owns(self, bridge_data: dict) -> bool:
@@ -277,3 +334,93 @@ class NipFaAdapter:
         if lookup.revalidation is Revalidation.UNAVAILABLE:
             return issuance_unavailable()
         return _issuance_response(await self.identity_keys.issue(lookup.session.identity))
+
+    async def issue_assertion(self, request: Request) -> Response:
+        """NIP-FA "Relay assertion". Authenticate (session, then NIP-98 proof of
+        the key) before authorizing (relay allowlist, then identity binding):
+        the proof's `payload` tag is what authenticates `relay_url`, so no
+        authorization decision is made on a body the key holder did not sign."""
+        lookup, denial = await self.authenticate(request.headers)
+        if denial is not None:
+            return denial
+        if lookup.revalidation is Revalidation.UNAVAILABLE:
+            return issuance_unavailable()
+        denial = await self._rate_limit_denial(lookup)
+        if denial is not None:
+            return denial
+        inputs = await _read_assertion_input(request)
+        if isinstance(inputs, Response):
+            return inputs
+        identity = lookup.session.identity
+        now = self.sessions.now()
+        denial = self._proof_denial(identity, inputs, now)
+        if denial is not None:
+            return denial
+        denial = self._relay_denial(identity, inputs.body)
+        if denial is not None:
+            return denial
+        denial = await self._binding_denial(identity, inputs.body.nostr_pubkey)
+        if denial is not None:
+            return denial
+        return self._assertion_response(lookup.session, inputs.body, now)
+
+    async def _rate_limit_denial(self, lookup: SessionLookup) -> Response | None:
+        try:
+            decision = await self.assertion_rate_limiter.check(lookup.record_key)
+        except RateLimiterUnavailable:
+            logger.error("nip-fa: assertion rate limiter unavailable mpass_id=%s", lookup.session.identity.sub)
+            return issuance_unavailable()
+        if decision.allowed:
+            return None
+        logger.warning("nip-fa: assertion refused mpass_id=%s reason=rate_limited", lookup.session.identity.sub)
+        return rate_limited(decision.retry_after_seconds)
+
+    def _proof_denial(self, identity: Identity, inputs: _AssertionInput, now: int) -> Response | None:
+        expected = ExpectedRequest(url=self._config.assertions_url, method="POST", body=inputs.raw_body)
+        result = verify_http_auth(inputs.proof, expected, now)
+        if isinstance(result, ProofFailure):
+            reason = result.value
+        elif result.pubkey != inputs.body.nostr_pubkey:
+            reason = "signer_is_not_nostr_pubkey"
+        else:
+            return None
+        logger.warning("nip-fa: assertion refused mpass_id=%s reason=invalid_proof detail=%s", identity.sub, reason)
+        return invalid_proof()
+
+    def _relay_denial(self, identity: Identity, body: AssertionRequest) -> Response | None:
+        if body.relay_url in self._config.relay_urls:
+            return None
+        logger.warning("nip-fa: assertion refused mpass_id=%s reason=unknown_relay", identity.sub)
+        return authorization_denied()
+
+    async def _binding_denial(self, identity: Identity, nostr_pubkey: str) -> Response | None:
+        issuance = await self.identity_keys.bind(identity)
+        refusal = _key_refusal(issuance.status)
+        if refusal is not None:
+            return refusal
+        if issuance.keypair.pubkey_hex == nostr_pubkey:
+            return None
+        logger.warning(
+            "nip-fa: assertion refused mpass_id=%s reason=binding_mismatch; requested key is not the "
+            "user's bound key",
+            identity.sub,
+        )
+        return binding_mismatch()
+
+    def _assertion_response(self, session: Session, body: AssertionRequest, now: int) -> Response:
+        expires_at = assertion_expiry(now, self._config.assertion_ttl_seconds, session.expires_at)
+        claims = assertion_claims(
+            issuer=self._config.nip_fi_issuer,
+            sub=session.identity.sub,
+            relay_url=body.relay_url,
+            nostr_pubkey=body.nostr_pubkey,
+            issued_at=now,
+            expires_at=expires_at,
+            profile=_profile_projection(session.identity.email),
+        )
+        assertion = sign_assertion(claims, self._gateway.signing_key())
+        logger.info(
+            "nip-fa: assertion issued mpass_id=%s pubkey=%s relay=%s exp=%d",
+            session.identity.sub, body.nostr_pubkey, relay_authority(body.relay_url), expires_at,
+        )
+        return adapter_json({"assertion": assertion, "nostr_pubkey": body.nostr_pubkey, "expires_at": expires_at})

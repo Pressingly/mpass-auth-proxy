@@ -29,12 +29,22 @@ def authorization_denied() -> JSONResponse:
     return denial(403, "authorization_denied")
 
 
+def invalid_proof() -> JSONResponse:
+    return denial(403, "invalid_proof")
+
+
 def binding_mismatch() -> JSONResponse:
     return denial(403, "binding_mismatch")
 
 
 def request_too_large() -> JSONResponse:
     return denial(413, "request_too_large")
+
+
+def rate_limited(retry_after_seconds: int) -> JSONResponse:
+    response = denial(429, "rate_limited")
+    response.headers["Retry-After"] = str(retry_after_seconds)
+    return response
 
 
 def issuance_unavailable() -> JSONResponse:

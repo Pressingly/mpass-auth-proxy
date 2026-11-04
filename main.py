@@ -154,8 +154,8 @@ redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 # scaling is not supported in this mode). With none of the three configured,
 # startup fails rather than degrading. Only an *absent* source falls through:
 # a B64 value that is set but unreadable is fatal, it does not try GCP next.
-# Loaded only when LAUNCHPAD_EMAIL_CAPTURE is on. See .env.example for the
-# full contract.
+# Loaded only when LAUNCHPAD_EMAIL_CAPTURE or BUZZ_ADAPTER_ENABLED is on. See
+# .env.example for the full contract.
 # ---------------------------------------------------------------------------
 
 
@@ -264,7 +264,7 @@ def _decode_signing_key_b64(value: str):
 
 
 def _load_signing_key():
-    """Load the RSA signing key. Called only when _EMAIL_CAPTURE_ENABLED.
+    """Load the RSA signing key. Called only when _signs_tokens().
 
     Precedence:
       1. MPASS_SIGNING_KEY_B64 non-empty          -> use it
@@ -358,11 +358,17 @@ def _load_signing_key():
     return private_key, kid
 
 
-# Only load a signing key when we are actually the signer. With the feature off
-# oauth2-proxy verifies against the IdP directly and this service never signs
-# anything, so requiring a signing key would be a deployment burden for a code
-# path that does not run.
-if _EMAIL_CAPTURE_ENABLED:
+def _signs_tokens() -> bool:
+    """Email capture re-signs id_tokens for oauth2-proxy; the Buzz adapter signs
+    NIP-FI relay assertions. Both use this one key and kid."""
+    return _EMAIL_CAPTURE_ENABLED or _BUZZ_ADAPTER_CONFIG.enabled
+
+
+# Only load a signing key when we are actually the signer. With both features
+# off oauth2-proxy verifies against the IdP directly and this service never
+# signs anything, so requiring a signing key would be a deployment burden for a
+# code path that does not run.
+if _signs_tokens():
     _SIGNING_PRIVATE_KEY, _SIGNING_KID = _load_signing_key()
 else:
     _SIGNING_PRIVATE_KEY, _SIGNING_KID = None, None
@@ -786,11 +792,13 @@ async def health():
 
 @app.get("/.well-known/jwks.json")
 async def jwks() -> dict:
-    # With email capture off this service does not sign anything -- oauth2-proxy
-    # is pointed at the IdP's JWKS instead. Serving an empty or invented key set
+    # With email capture and the Buzz adapter both off this service does not
+    # sign anything -- oauth2-proxy is pointed at the IdP's JWKS instead. With
+    # only the adapter on, this serves the Buzz relays' NIP-FI key while
+    # oauth2-proxy still trusts the IdP. Serving an empty or invented key set
     # here would be worse than 404: a misconfigured oauth2-proxy pointed at us
     # would fail verification with no indication why.
-    if not _EMAIL_CAPTURE_ENABLED:
+    if not _signs_tokens():
         raise HTTPException(
             status_code=404,
             detail=(
@@ -1285,6 +1293,9 @@ class _PlatformGateway:
         except (KeyError, ValueError) as exc:
             raise nip_fa.IdpUnavailable("OIDC discovery document is unusable") from exc
         return await _post_refresh_grant(refresh_token)
+
+    def signing_key(self) -> nip_fa.SigningKey:
+        return nip_fa.SigningKey(private_key=_SIGNING_PRIVATE_KEY, kid=_SIGNING_KID)
 
     async def corporate_id_allowed(self, access_token: str) -> bool:
         try:

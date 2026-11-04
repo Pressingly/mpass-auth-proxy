@@ -17,6 +17,7 @@ from .adapter import (
     NipFaAdapter,
     PlatformGateway,
 )
+from .assertions import SigningKey
 from .config import AdapterConfig, AdapterConfigError
 from .identities import IdentityStoreUnavailable
 from .sessions import IdpUnavailable
@@ -31,4 +32,5 @@ __all__ = [
     "IdpUnavailable",
     "NipFaAdapter",
     "PlatformGateway",
+    "SigningKey",
 ]
