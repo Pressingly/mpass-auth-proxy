@@ -106,7 +106,9 @@ class IdentityKeyService:
     def __repr__(self) -> str:
         return "IdentityKeyService(<redacted>)"
 
-    async def issue(self, identity: Identity) -> KeyIssuance:
+    async def bind(self, identity: Identity) -> KeyIssuance:
+        """The user's bound custodial keypair, binding it on first use. Logs
+        refusals; the caller logs what it does with an issued keypair."""
         keypair = derive_keypair(self._master_secret, self._salt, identity.sub)
         try:
             stored = await self._store.ensure_identity(identity.sub, keypair.pubkey_hex, identity.email)
@@ -114,18 +116,22 @@ class IdentityKeyService:
             logger.warning("nip-fa: identity key unavailable for mpass_id=%s", identity.sub)
             return KeyIssuance(KeyIssuanceStatus.UNAVAILABLE)
         status = issuance_status(keypair.pubkey_hex, stored)
-        _log_outcome(identity.sub, keypair.pubkey_hex, status, stored)
         if status is not KeyIssuanceStatus.ISSUED:
+            _log_refusal(identity.sub, status, stored)
             return KeyIssuance(status)
         return KeyIssuance(status, keypair)
 
+    async def issue(self, identity: Identity) -> KeyIssuance:
+        issuance = await self.bind(identity)
+        if issuance.status is KeyIssuanceStatus.ISSUED:
+            logger.info(
+                "nip-fa: identity key issued mpass_id=%s pubkey=%s", identity.sub, issuance.keypair.pubkey_hex
+            )
+        return issuance
 
-def _log_outcome(
-    mpass_id: str, pubkey_hex: str, status: KeyIssuanceStatus, stored: StoredIdentity | None
-) -> None:
-    if status is KeyIssuanceStatus.ISSUED:
-        logger.info("nip-fa: identity key issued mpass_id=%s pubkey=%s", mpass_id, pubkey_hex)
-    elif status is KeyIssuanceStatus.REVOKED:
+
+def _log_refusal(mpass_id: str, status: KeyIssuanceStatus, stored: StoredIdentity | None) -> None:
+    if status is KeyIssuanceStatus.REVOKED:
         logger.warning("nip-fa: identity key refused mpass_id=%s reason=revoked", mpass_id)
     elif stored is None:
         logger.error(

@@ -63,6 +63,7 @@ class SessionLookup:
     status: LookupStatus
     session: Session | None = None
     revalidation: Revalidation | None = None
+    record_key: str = ""
 
 
 class IdpUnavailable(Exception):
@@ -161,6 +162,12 @@ class SessionService:
         return session_token, session
 
     async def lookup(self, session_token: str) -> SessionLookup:
+        """`record_key` is the token's Redis key, for keying per-session state
+        without holding the token itself."""
+        result = await self._lookup(session_token)
+        return replace(result, record_key=session_key(session_token))
+
+    async def _lookup(self, session_token: str) -> SessionLookup:
         session = await self._store.load(session_token)
         if session is None:
             return SessionLookup(LookupStatus.MISSING)

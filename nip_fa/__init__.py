@@ -11,14 +11,15 @@ the desktop's non-redirecting HTTP client with a 302.
 """
 
 from .adapter import (
-    ROUTE_PREFIX,
     EmailVerificationRequired,
     IdentityUnavailable,
     NipFaAdapter,
     PlatformGateway,
 )
+from .assertions import SigningKey
 from .config import AdapterConfig, AdapterConfigError
 from .identities import IdentityStoreUnavailable
+from .routes import ROUTE_PREFIX
 from .sessions import IdpUnavailable
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "IdpUnavailable",
     "NipFaAdapter",
     "PlatformGateway",
+    "SigningKey",
 ]
