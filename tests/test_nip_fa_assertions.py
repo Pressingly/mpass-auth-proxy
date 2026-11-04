@@ -191,6 +191,7 @@ class TestAssertionBody:
         b'{"relay_url": "wss://a.example.com", "relay_url": "wss://r.example.com", "nostr_pubkey": "'
         + b"a" * 64 + b'"}',
         b"[" * 2048 + b"]" * 2048,
+        json.dumps({"relay_url": "wss://r.example.com", "nostr_pubkey": "a" * 64}).encode("utf-16"),
     ])
     def test_rejects_everything_else(self, raw):
         assert parse_assertion_body(raw) is None

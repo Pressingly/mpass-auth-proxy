@@ -247,6 +247,11 @@ class TestNip98Verifier:
         header = "Nostr " + base64.b64encode(b"[" * 3000 + b"]" * 3000).decode("ascii")
         assert self._verify(header) is ProofFailure.MALFORMED_HEADER
 
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+    def test_event_json_must_be_utf8(self, encoding):
+        header = "Nostr " + base64.b64encode(json.dumps(self._event()).encode(encoding)).decode("ascii")
+        assert self._verify(header) is ProofFailure.MALFORMED_HEADER
+
     def test_duplicate_json_keys_are_refused(self):
         event = self._event()
         raw = json.dumps(event)[:-1] + ', "content": "other"}'
