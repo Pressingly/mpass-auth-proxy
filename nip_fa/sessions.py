@@ -11,6 +11,8 @@ from typing import Protocol
 
 import httpx
 
+from .sealing import seal, unseal
+
 logger = logging.getLogger(__name__)
 
 REVALIDATION_INTERVAL_SECONDS = 3600
@@ -36,19 +38,6 @@ class Session:
 
     def __repr__(self) -> str:
         return f"Session(sub={self.identity.sub!r}, expires_at={self.expires_at})"
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self))
-
-    @classmethod
-    def from_json(cls, raw: str) -> "Session":
-        data = json.loads(raw)
-        return cls(
-            identity=Identity(**data["identity"]),
-            refresh_token=data["refresh_token"],
-            expires_at=data["expires_at"],
-            revalidated_at=data["revalidated_at"],
-        )
 
     def expired_at(self, now: int) -> bool:
         return now >= self.expires_at
@@ -94,18 +83,46 @@ def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def encode_record(session_token: str, session: Session) -> str:
+    return json.dumps({
+        "identity": asdict(session.identity),
+        "sealed_refresh_token": seal(session_token, session.refresh_token),
+        "expires_at": session.expires_at,
+        "revalidated_at": session.revalidated_at,
+    })
+
+
+def decode_record(session_token: str, raw: str) -> Session | None:
+    """The session, or None when the record cannot be trusted for this token."""
+    data = json.loads(raw)
+    refresh_token = unseal(session_token, data["sealed_refresh_token"])
+    if refresh_token is None:
+        return None
+    return Session(
+        identity=Identity(**data["identity"]),
+        refresh_token=refresh_token,
+        expires_at=data["expires_at"],
+        revalidated_at=data["revalidated_at"],
+    )
+
+
 class SessionStore:
     def __init__(self, redis_factory):
         self._redis_factory = redis_factory
 
     async def put(self, session_token: str, session: Session, now: int) -> None:
         await self._redis_factory().setex(
-            session_key(session_token), session.expires_at - now, session.to_json()
+            session_key(session_token), session.expires_at - now, encode_record(session_token, session)
         )
 
     async def load(self, session_token: str) -> Session | None:
         raw = await self._redis_factory().get(session_key(session_token))
-        return Session.from_json(raw) if raw else None
+        if not raw:
+            return None
+        session = decode_record(session_token, raw)
+        if session is None:
+            logger.warning("nip-fa: session record failed to unseal; treating as no session")
+        return session
 
     async def delete(self, session_token: str) -> None:
         await self._redis_factory().delete(session_key(session_token))

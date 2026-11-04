@@ -10,7 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main as m
-from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, session_key
+from nip_fa.sealing import seal, unseal
+from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, decode_record, session_key
 from nip_fa.validation import b64url_sha256, is_loopback_callback, is_sha256_challenge
 from tests.test_main import (  # noqa: F401  (autouse fixtures apply by import)
     _CLIENT_ID,
@@ -449,6 +450,38 @@ class TestCodeExchange:
         assert body["profile_projection"] == {"username": _MPASS_ID, "display_name": _MPASS_ID}
 
 
+class TestRefreshTokenSealing:
+    def test_stored_record_holds_no_plaintext_refresh_token(self, redis_store, clock):
+        token = _signed_in(redis_store, clock)
+
+        raw = redis_store.values[session_key(token)]
+        assert _REFRESH_TOKEN not in raw
+        assert "refresh_token" not in json.loads(raw)
+        assert decode_record(token, raw).refresh_token == _REFRESH_TOKEN
+
+    def test_seal_round_trips_with_a_fresh_nonce_each_time(self):
+        first, second = seal("token-a", _REFRESH_TOKEN), seal("token-a", _REFRESH_TOKEN)
+        assert first != second
+        assert unseal("token-a", first) == unseal("token-a", second) == _REFRESH_TOKEN
+
+    @pytest.mark.parametrize("sealed", ["", "not base64!", "AAAA", None])
+    def test_unseal_fails_closed_on_garbage(self, sealed):
+        assert unseal("token-a", sealed) is None
+
+    def test_unseal_with_another_token_fails(self):
+        assert unseal("token-b", seal("token-a", _REFRESH_TOKEN)) is None
+
+    def test_record_moved_under_another_token_is_not_trusted(self, redis_store, clock):
+        victim = _signed_in(redis_store, clock)
+        attacker = _signed_in(redis_store, clock)
+        redis_store.values[session_key(attacker)] = redis_store.values[session_key(victim)]
+
+        response = _session(attacker)
+        assert response.status_code == 401
+        assert response.json() == {"error": "session_required"}
+        assert _session(victim).status_code == 200
+
+
 class TestSessionCheck:
     def test_missing_authorization_is_session_required(self, redis_store):
         response = client.get("/nip-fa/v1/session")
@@ -520,9 +553,11 @@ class TestSessionRevalidation:
         assert response.json()["expires_at"] == original_expires_at
         assert posted["grant_type"] == "refresh_token"
         assert posted["refresh_token"] == _REFRESH_TOKEN
-        record = json.loads(redis_store.values[session_key(token)])
-        assert record["refresh_token"] == _ROTATED_REFRESH_TOKEN
-        assert record["revalidated_at"] == clock.now
+        raw = redis_store.values[session_key(token)]
+        assert _ROTATED_REFRESH_TOKEN not in raw
+        renewed = decode_record(token, raw)
+        assert renewed.refresh_token == _ROTATED_REFRESH_TOKEN
+        assert renewed.revalidated_at == clock.now
         assert redis_store.ttls[session_key(token)] == (
             m._BUZZ_ADAPTER_CONFIG.session_ttl_seconds - REVALIDATION_INTERVAL_SECONDS
         )
