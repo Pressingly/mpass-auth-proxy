@@ -88,6 +88,10 @@ class _CountingRedis(_RecordingRedis):
     def ttl_now(self, key):
         return self.ttls.get(key, -1)
 
+    async def expire(self, key, seconds):
+        self.ttls[key] = seconds
+        return True
+
 
 @pytest.fixture()
 def redis_store(monkeypatch):
@@ -531,6 +535,16 @@ class TestRateLimit:
         redis_store.ttls[key] = 7
         _request_assertion(token)
         assert redis_store.ttls[key] == 7
+
+    def test_a_counter_left_without_expiry_gets_its_window_back(self, redis_store, clock, identity_store):
+        token = _signed_in(redis_store, clock)
+        _request_assertion(token)
+        key = AssertionRateLimiter.KEY_PREFIX + session_key(token)
+        del redis_store.ttls[key]
+
+        _request_assertion(token)
+
+        assert redis_store.ttls[key] == ASSERTION_RATE_WINDOW_SECONDS
 
     def test_counts_requests_before_the_proof_is_checked(self, redis_store, clock, identity_store):
         token = _signed_in(redis_store, clock)

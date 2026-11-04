@@ -118,6 +118,9 @@ class RateDecision:
     retry_after_seconds: int = 0
 
 
+_NO_EXPIRY = -1
+
+
 class AssertionRateLimiter:
     """A fixed window per adapter session, counted in Redis under the session
     record's key (a token hash), never the token itself."""
@@ -147,4 +150,7 @@ class AssertionRateLimiter:
             pipe.incr(key)
             pipe.ttl(key)
             _, count, ttl = await pipe.execute()
+        if int(ttl) == _NO_EXPIRY:
+            await self._redis_factory().expire(key, self._window_seconds)
+            return int(count), self._window_seconds
         return int(count), int(ttl)
