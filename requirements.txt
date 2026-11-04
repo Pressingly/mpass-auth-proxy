@@ -6,3 +6,4 @@ PyJWT[crypto]==2.9.0
 python-multipart==0.0.20
 asyncpg==0.30.0
 google-cloud-secret-manager==2.20.2
+coincurve==21.0.0
