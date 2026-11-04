@@ -782,6 +782,42 @@ class TestRevalidationErrorHandling:
         with pytest.raises(TypeError):
             _session(token)
 
+    @pytest.mark.parametrize("discovery", [
+        httpx.Response(200, json={"issuer": "no token_endpoint"}),
+        httpx.Response(200, content=b"<html>not json</html>"),
+        httpx.Response(503, content=b"down"),
+    ])
+    def test_unusable_discovery_document_keeps_the_session(self, redis_store, clock, monkeypatch, discovery):
+        token = _signed_in(redis_store, clock)
+        before = redis_store.values[session_key(token)]
+        m._token_endpoint_cache = None
+        discovery.request = httpx.Request("GET", m.OIDC_DISCOVERY_URL)
+
+        async def fake_get(self_inner, url, **kwargs):
+            return discovery
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        assert _session(token).status_code == 200
+        assert redis_store.values[session_key(token)] == before
+
+    def test_refresh_grant_uses_the_shared_idp_timeout(self, redis_store, clock, monkeypatch, fake_token_endpoint):
+        token = _signed_in(redis_store, clock)
+        timeouts = []
+        real_init = httpx.AsyncClient.__init__
+
+        def recording_init(self_inner, *args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            real_init(self_inner, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "__init__", recording_init)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _idp_refresh_response())
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        assert _session(token).status_code == 200
+        assert timeouts[-1] == m._IDP_REFRESH_TIMEOUT_SECONDS == 20.0
+
     def test_unexpected_error_from_the_corporate_check_is_not_swallowed(
         self, redis_store, clock, monkeypatch, fake_token_endpoint
     ):

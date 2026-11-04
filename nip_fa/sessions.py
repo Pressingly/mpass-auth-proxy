@@ -66,8 +66,13 @@ class SessionLookup:
     revalidation: Revalidation | None = None
 
 
+class IdpUnavailable(Exception):
+    """The IdP could not be asked, for a reason other than an HTTP transport error."""
+
+
 class IdentityProvider(Protocol):
-    async def refresh_grant(self, refresh_token: str) -> httpx.Response: ...
+    async def refresh_grant(self, refresh_token: str) -> httpx.Response:
+        """Raises httpx.HTTPError or IdpUnavailable when the IdP cannot be asked."""
 
     async def corporate_id_allowed(self, access_token: str) -> bool: ...
 
@@ -199,7 +204,7 @@ class SessionService:
     async def _ask_idp(self, session: Session) -> tuple[Revalidation, str | None]:
         try:
             response = await self._idp.refresh_grant(session.refresh_token)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, IdpUnavailable) as exc:
             logger.warning("nip-fa: refresh grant failed: %s", type(exc).__name__)
             return Revalidation.UNAVAILABLE, None
         if response.status_code != 200:

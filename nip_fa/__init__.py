@@ -18,6 +18,7 @@ from .adapter import (
     PlatformGateway,
 )
 from .config import AdapterConfig, AdapterConfigError
+from .sessions import IdpUnavailable
 
 __all__ = [
     "ROUTE_PREFIX",
@@ -25,6 +26,7 @@ __all__ = [
     "AdapterConfigError",
     "EmailVerificationRequired",
     "IdentityUnavailable",
+    "IdpUnavailable",
     "NipFaAdapter",
     "PlatformGateway",
 ]
