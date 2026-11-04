@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -942,7 +943,10 @@ async def bridge_token(request: Request) -> Response:
     logger.warning("bridge_token: grant_type=%s form_keys=%s", grant_type, list(form.keys()))
 
     if grant_type == "refresh_token":
-        return await _handle_refresh_token(str(form.get("refresh_token", "")))
+        return await _handle_refresh_token(
+            str(form.get("refresh_token", "")),
+            client=_refresh_client_label(set(form.keys()), str(form.get("client_id", ""))),
+        )
 
     if grant_type == "authorization_code":
         return await _handle_authorization_code(
@@ -958,10 +962,11 @@ class _TokenOutcome:
     status_code: int
     content: str
     media_type: str | None = None
+    sub: str | None = None
 
 
-def _json_outcome(body: dict, status_code: int = 200) -> _TokenOutcome:
-    return _TokenOutcome(status_code, json.dumps(body), "application/json")
+def _json_outcome(body: dict, status_code: int = 200, sub: str | None = None) -> _TokenOutcome:
+    return _TokenOutcome(status_code, json.dumps(body), "application/json", sub)
 
 
 def _token_error_outcome(error: str, description: str, status_code: int) -> _TokenOutcome:
@@ -1045,32 +1050,75 @@ def _refresh_key(refresh_token: str) -> str:
     return hashlib.sha256(refresh_token.encode()).hexdigest()
 
 
+def _token_ref(refresh_token: str) -> str:
+    return _refresh_key(refresh_token)[:8]
+
+
+_BROWSER_REFRESH_FORM_KEYS = frozenset({"grant_type", "refresh_token"})
+_UNSAFE_LOG_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _refresh_client_label(form_keys: set[str], client_id: str) -> str:
+    """oauth2-proxy sends only the grant and the token; FastMCP's OAuth proxy
+    also sends scope and its public client_id."""
+    if form_keys == _BROWSER_REFRESH_FORM_KEYS:
+        return "browser"
+    if client_id:
+        return f"mcp:{_UNSAFE_LOG_CHARS.sub('?', client_id)[:64]}"
+    return "other"
+
+
 def _forget_refresh(key: str, task: asyncio.Task[_TokenOutcome]) -> None:
     if _refreshes_in_flight.get(key) is task:
         del _refreshes_in_flight[key]
 
 
-def _shared_refresh(refresh_token: str) -> asyncio.Task[_TokenOutcome]:
+_RefreshRole = Literal["led", "joined"]
+
+
+def _shared_refresh(refresh_token: str) -> tuple[asyncio.Task[_TokenOutcome], _RefreshRole]:
     key = _refresh_key(refresh_token)
     in_flight = _refreshes_in_flight.get(key)
     if in_flight is not None:
-        logger.warning("bridge_token refresh: joined in-flight refresh key=%s", key[:8])
-        return in_flight
+        return in_flight, "joined"
     task = asyncio.create_task(_refresh_outcome(refresh_token))
     _refreshes_in_flight[key] = task
     task.add_done_callback(functools.partial(_forget_refresh, key))
-    return task
+    return task, "led"
 
 
-async def _handle_refresh_token(refresh_token: str) -> Response:
+def _log_refresh_result(
+    outcome: _TokenOutcome, refresh_token: str, client: str, role: _RefreshRole,
+) -> None:
+    if outcome.status_code == 200:
+        logger.info(
+            "bridge_token refresh: issued new tokens sub=%s client=%s role=%s",
+            outcome.sub, client, role,
+        )
+        return
+    logger.warning(
+        "bridge_token refresh: failed status=%d token=%s client=%s role=%s",
+        outcome.status_code, _token_ref(refresh_token), client, role,
+    )
+
+
+async def _handle_refresh_token(refresh_token: str, client: str = "other") -> Response:
     if not refresh_token:
         return Response(status_code=400, content="Missing refresh_token")
+    task, role = _shared_refresh(refresh_token)
     # shield: a caller that disconnects must not cancel the refresh the others wait on.
-    outcome = await asyncio.shield(_shared_refresh(refresh_token))
+    outcome = await asyncio.shield(task)
+    _log_refresh_result(outcome, refresh_token, client, role)
     return _response_from(outcome)
 
 
+def _id_token_sub(id_token: str) -> str | None:
+    claims = _decode_id_token_claims_unsafe(id_token)
+    return claims.get("sub") if claims else None
+
+
 async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
+    token_ref = _token_ref(refresh_token)
     payload: dict = {
         "grant_type": "refresh_token",
         "client_id": OIDC_CLIENT_ID,
@@ -1089,26 +1137,31 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
             )
     except httpx.HTTPError as exc:
         logger.error(
-            "bridge_token refresh: IdP request failed: %s: %s", type(exc).__name__, exc,
+            "bridge_token refresh: IdP request failed token=%s: %s: %s",
+            token_ref, type(exc).__name__, exc,
         )
         return _TokenOutcome(502, "Token refresh failed")
 
     if resp.status_code != 200:
-        logger.warning("bridge_token refresh: IdP returned %d: %s", resp.status_code, resp.text)
+        logger.warning(
+            "bridge_token refresh: IdP returned %d token=%s: %s",
+            resp.status_code, token_ref, resp.text,
+        )
         return _TokenOutcome(resp.status_code, resp.text)
 
     try:
         token_body = resp.json()
     except Exception:
-        logger.error("bridge_token refresh: invalid JSON from IdP")
+        logger.error("bridge_token refresh: invalid JSON from IdP token=%s", token_ref)
         return _TokenOutcome(502, "Invalid response from token endpoint")
 
     required_fields = ("access_token", "id_token")
     missing_fields = [field for field in required_fields if not token_body.get(field)]
     if missing_fields:
         logger.error(
-            "bridge_token refresh: incomplete token response from IdP, missing fields: %s",
-            ", ".join(missing_fields),
+            "bridge_token refresh: incomplete token response from IdP token=%s, "
+            "missing fields: %s",
+            token_ref, ", ".join(missing_fields),
         )
         return _TokenOutcome(502, "Incomplete response from token endpoint")
 
@@ -1116,7 +1169,9 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
     try:
         await _validate_corporate_id(token_body["access_token"])
     except CorporateIdMismatch as exc:
-        logger.warning("bridge_token refresh: corporate-id check failed: %s", exc)
+        logger.warning(
+            "bridge_token refresh: corporate-id check failed token=%s: %s", token_ref, exc,
+        )
         reason = exc.reason or "access_denied"
         return _json_outcome({"error": "access_denied", "reason": reason}, 403)
 
@@ -1128,7 +1183,9 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
     try:
         issued_id_token = await _issue_id_token(token_body["id_token"])
     except EmailOverlayUnavailable as exc:
-        logger.error("bridge_token refresh: email overlay unavailable: %s", exc)
+        logger.error(
+            "bridge_token refresh: email overlay unavailable token=%s: %s", token_ref, exc,
+        )
         return _token_error_outcome(
             "temporarily_unavailable", "Email overlay unavailable", 503,
         )
@@ -1142,5 +1199,4 @@ async def _refresh_outcome(refresh_token: str) -> _TokenOutcome:
         "expires_in": SESSION_EXPIRES_IN,
         "refresh_token": token_body.get("refresh_token") or refresh_token,
     }
-    logger.info("bridge_token refresh: issued new tokens from IdP")
-    return _json_outcome(body)
+    return _json_outcome(body, sub=_id_token_sub(token_body["id_token"]))

@@ -1077,6 +1077,98 @@ class TestRefreshCoalescing:
         assert m._refreshes_in_flight == {}
 
 
+def _refresh_log_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "bridge_token refresh" in r.getMessage()]
+
+
+class TestRefreshClientLabel:
+    def test_oauth2_proxy_form_is_browser(self):
+        assert m._refresh_client_label({"grant_type", "refresh_token"}, "") == "browser"
+
+    def test_fastmcp_form_is_mcp_with_its_client_id(self):
+        keys = {"grant_type", "refresh_token", "scope", "client_id"}
+        assert m._refresh_client_label(keys, "abc-123_x.y") == "mcp:abc-123_x.y"
+
+    def test_client_id_cannot_inject_log_lines(self):
+        keys = {"grant_type", "refresh_token", "client_id"}
+        label = m._refresh_client_label(keys, "evil\nINFO forged line" + "x" * 100)
+        assert "\n" not in label
+        assert " " not in label
+        assert len(label) == len("mcp:") + 64
+
+    def test_unrecognised_form_is_other(self):
+        assert m._refresh_client_label({"grant_type", "refresh_token", "scope"}, "") == "other"
+
+
+class TestRefreshLogFields:
+    """Refresh log lines must tie a burst together and name who it was for,
+    without ever carrying a token."""
+
+    @pytest.mark.asyncio
+    async def test_success_names_sub_client_and_role(self, gated_idp, caplog):
+        caplog.set_level(logging.INFO, logger="main")
+        idp = gated_idp()
+        leader = asyncio.create_task(m._handle_refresh_token("same.refresh", client="mcp:abc"))
+        await _settle()
+        joiner = asyncio.create_task(m._handle_refresh_token("same.refresh", client="browser"))
+        await _settle()
+        idp.gate.set()
+        await asyncio.gather(leader, joiner)
+
+        lines = _refresh_log_lines(caplog)
+        assert "bridge_token refresh: issued new tokens sub=u client=mcp:abc role=led" in lines
+        assert "bridge_token refresh: issued new tokens sub=u client=browser role=joined" in lines
+        assert not any("same.refresh" in line for line in lines)
+
+    @pytest.mark.asyncio
+    async def test_timeout_names_exception_type_and_token_hash(self, gated_idp, caplog):
+        caplog.set_level(logging.INFO, logger="main")
+        idp = gated_idp(_idp_timeout)
+        tasks = _start_refreshes(*["same.refresh"] * 2)
+        await _settle()
+        idp.gate.set()
+        await asyncio.gather(*tasks)
+
+        token_ref = hashlib.sha256(b"same.refresh").hexdigest()[:8]
+        lines = _refresh_log_lines(caplog)
+        assert f"bridge_token refresh: IdP request failed token={token_ref}: ReadTimeout: " in lines
+        assert lines.count(
+            f"bridge_token refresh: failed status=502 token={token_ref} client=other role=led"
+        ) == 1
+        assert lines.count(
+            f"bridge_token refresh: failed status=502 token={token_ref} client=other role=joined"
+        ) == 1
+        assert not any("same.refresh" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        ("form", "label"),
+        [
+            ({}, "browser"),
+            ({"scope": "openid", "client_id": "fastmcp-client"}, "mcp:fastmcp-client"),
+        ],
+    )
+    def test_bridge_token_tags_the_requesting_client(
+        self, monkeypatch, fake_token_endpoint, caplog, form, label,
+    ):
+        caplog.set_level(logging.INFO, logger="main")
+
+        async def fake_post(self_inner, url, **kwargs):
+            return _idp_success(kwargs["data"])
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        response = client.post(
+            "/token",
+            data={"grant_type": "refresh_token", "refresh_token": "r", **form},
+        )
+
+        assert response.status_code == 200
+        assert (
+            f"bridge_token refresh: issued new tokens sub=u client={label} role=led"
+            in _refresh_log_lines(caplog)
+        )
+
+
 class TestMpassLogin:
     def test_redirects_to_oauth2_sign_in(self):
         response = client.get("/mpass/login", follow_redirects=False)
