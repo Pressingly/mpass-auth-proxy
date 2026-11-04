@@ -1276,9 +1276,10 @@ class _PlatformGateway:
 
     async def refresh_grant(self, refresh_token: str) -> httpx.Response:
         try:
-            return await _post_refresh_grant(refresh_token)
+            await _get_token_endpoint()
         except (KeyError, ValueError) as exc:
             raise nip_fa.IdpUnavailable("OIDC discovery document is unusable") from exc
+        return await _post_refresh_grant(refresh_token)
 
     async def corporate_id_allowed(self, access_token: str) -> bool:
         try:
