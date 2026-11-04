@@ -26,6 +26,7 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/nip-fa/v1/login/start` | Buzz NIP-FA browser login: validates the loopback `return_to` and S256 handoff challenge, then joins the Moneta login (only when `BUZZ_ADAPTER_ENABLED`) |
 | `POST` | `/nip-fa/v1/login/exchange` | Buzz NIP-FA code exchange: single-use code + handoff secret for an adapter session |
 | `GET`  | `/nip-fa/v1/session` | Buzz NIP-FA session check (Bearer adapter session), revalidated against Cognito at most hourly |
+| `GET`  | `/nip-fa/v1/identity/key` | Our extension to NIP-FA (Bearer adapter session): returns the platform-held Nostr key `{nostr_pubkey, secret_key}` for the session's mPass ID, the same key on every device |
 
 ### Traefik routing — cross-repo invariant
 
@@ -62,9 +63,23 @@ Optional: `OIDC_CLIENT_SECRET`, `SESSION_COOKIE_MAX_AGE_SECONDS`,
 `LOG_LEVEL`.
 
 The Buzz NIP-FA adapter (`BUZZ_ADAPTER_ENABLED`, off by default) requires
-`BUZZ_IDENTITY_MASTER_SECRET` (64 hex characters) and reads the optional
+`BUZZ_IDENTITY_MASTER_SECRET` (64 hex characters), `BUZZ_IDENTITY_SALT` (hex,
+32 to 128 characters) and `LAUNCHPAD_DB_PASSWORD`, and reads the optional
 `BUZZ_ADAPTER_SESSION_TTL_SECONDS` (default 2592000, 30 days). The service
-refuses to start with the flag on and the secret missing or malformed.
+refuses to start with the flag on and any of the three missing or malformed.
+
+Each user's Nostr key is
+`HKDF-SHA256(ikm=master secret, salt=identity salt, info="moneta-buzz/nostr-key/v1|" + uint16_be(len(mPass ID)) + mPass ID + attempt byte)`,
+where the attempt byte is 0 unless that scalar is out of range for secp256k1,
+so changing either value re-keys every Buzz user. The first issuance binds the
+public key in launchpad's `buzz_identities` table; a later derivation that no
+longer matches it is refused with `binding_mismatch` rather than issuing a new
+identity. The master secret also seals the adapter's Redis records, so rotating
+it signs every Buzz session out.
+
+**Deploy order:** `buzz_identities` and its grants come from launchpad-api's
+`sql/schema.sql`. Apply that schema (`python -m src.migrate`) before enabling
+the adapter here, or `/nip-fa/v1/identity/key` answers `503 issuance_unavailable`.
 
 Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
 the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),
