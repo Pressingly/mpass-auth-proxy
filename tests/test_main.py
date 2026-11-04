@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import importlib
 import base64 as _b64
@@ -70,6 +71,15 @@ def reset_jwks_cache():
     m._jwks_fetched_at = None
     m._token_endpoint_cache = None
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_refreshes_in_flight():
+    """A task left registered by one async test belongs to that test's closed
+    loop; a later refresh for the same token would otherwise await it."""
+    m._refreshes_in_flight.clear()
+    yield
+    m._refreshes_in_flight.clear()
 
 
 @pytest.fixture()
@@ -869,6 +879,202 @@ class TestRefreshToken:
         )
 
         assert response.status_code == 502
+
+
+class _GatedIdP:
+    """Fake Cognito token endpoint that holds every POST until released, so a
+    test can line callers up behind one in-flight refresh before it settles."""
+
+    def __init__(self, respond):
+        self._respond = respond
+        self.gate = asyncio.Event()
+        self.posts: list[dict] = []
+        self.timeouts: list[float | None] = []
+
+    async def post(self, client, url, **kwargs):
+        self.posts.append(kwargs["data"])
+        self.timeouts.append(client.timeout.read)
+        await self.gate.wait()
+        return self._respond(kwargs["data"])
+
+
+def _idp_success(form: dict):
+    class FakeResp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "access_token": f"access-for-{form['refresh_token']}",
+                "id_token": _make_jwt({"cognito:username": "u", "sub": "u", "exp": 9_999_999_999}),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+    return FakeResp()
+
+
+def _idp_invalid_grant(form: dict):
+    class FakeResp:
+        status_code = 400
+        text = '{"error":"invalid_grant"}'
+
+        def json(self):
+            return {"error": "invalid_grant"}
+    return FakeResp()
+
+
+def _idp_timeout(form: dict):
+    raise httpx.ReadTimeout("")
+
+
+@pytest.fixture()
+def gated_idp(monkeypatch, fake_token_endpoint):
+    def install(respond=_idp_success) -> _GatedIdP:
+        idp = _GatedIdP(respond)
+
+        async def post(client, url, **kwargs):
+            return await idp.post(client, url, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", post)
+        return idp
+    return install
+
+
+async def _settle():
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _start_refreshes(*refresh_tokens: str) -> list[asyncio.Task]:
+    return [asyncio.create_task(m._handle_refresh_token(token)) for token in refresh_tokens]
+
+
+class TestRefreshCoalescing:
+    """Concurrent refreshes of one token share a single Cognito call. Cognito
+    answers same-token refreshes serially, so without this the last of a burst
+    timed out and the MCP client had to reconnect."""
+
+    @pytest.mark.asyncio
+    async def test_identical_refreshes_share_one_upstream_call(self, gated_idp):
+        idp = gated_idp()
+        tasks = _start_refreshes(*["same.refresh"] * 3)
+        await _settle()
+
+        assert len(idp.posts) == 1
+        assert len(m._refreshes_in_flight) == 1
+
+        idp.gate.set()
+        responses = await asyncio.gather(*tasks)
+
+        assert [r.status_code for r in responses] == [200, 200, 200]
+        bodies = [json.loads(r.body) for r in responses]
+        assert all(body == bodies[0] for body in bodies)
+        assert bodies[0]["access_token"] == "access-for-same.refresh"
+        assert bodies[0]["refresh_token"] == "same.refresh"
+        assert len({id(r) for r in responses}) == 3
+        assert all(r.media_type == "application/json" for r in responses)
+        assert len(idp.posts) == 1
+        assert m._refreshes_in_flight == {}
+
+    @pytest.mark.asyncio
+    async def test_registry_never_holds_the_raw_token(self, gated_idp):
+        idp = gated_idp()
+        tasks = _start_refreshes("secret.refresh")
+        await _settle()
+
+        assert "secret.refresh" not in m._refreshes_in_flight
+        assert list(m._refreshes_in_flight) == [
+            hashlib.sha256(b"secret.refresh").hexdigest()
+        ]
+
+        idp.gate.set()
+        await asyncio.gather(*tasks)
+
+    @pytest.mark.asyncio
+    async def test_refresh_uses_the_raised_timeout(self, gated_idp):
+        idp = gated_idp()
+        idp.gate.set()
+
+        await m._handle_refresh_token("some.refresh")
+
+        assert idp.timeouts == [m._IDP_REFRESH_TIMEOUT_SECONDS]
+        assert m._IDP_REFRESH_TIMEOUT_SECONDS > 10.0
+
+    @pytest.mark.asyncio
+    async def test_different_tokens_are_not_coalesced(self, gated_idp):
+        idp = gated_idp()
+        tasks = _start_refreshes("token.a", "token.b")
+        await _settle()
+
+        assert len(idp.posts) == 2
+        assert len(m._refreshes_in_flight) == 2
+
+        idp.gate.set()
+        first, second = await asyncio.gather(*tasks)
+
+        assert json.loads(first.body)["access_token"] == "access-for-token.a"
+        assert json.loads(second.body)["access_token"] == "access-for-token.b"
+
+    @pytest.mark.asyncio
+    async def test_upstream_timeout_reaches_every_waiter_then_clears(self, gated_idp):
+        idp = gated_idp(_idp_timeout)
+        tasks = _start_refreshes(*["same.refresh"] * 3)
+        await _settle()
+        idp.gate.set()
+        responses = await asyncio.gather(*tasks)
+
+        assert [r.status_code for r in responses] == [502, 502, 502]
+        assert all(r.body == b"Token refresh failed" for r in responses)
+        assert len(idp.posts) == 1
+        assert m._refreshes_in_flight == {}
+
+        retry = await m._handle_refresh_token("same.refresh")
+
+        assert retry.status_code == 502
+        assert len(idp.posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_upstream_rejection_reaches_every_waiter(self, gated_idp):
+        idp = gated_idp(_idp_invalid_grant)
+        tasks = _start_refreshes(*["revoked.refresh"] * 2)
+        await _settle()
+        idp.gate.set()
+        responses = await asyncio.gather(*tasks)
+
+        assert [r.status_code for r in responses] == [400, 400]
+        assert all(r.body == b'{"error":"invalid_grant"}' for r in responses)
+        assert len(idp.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_overlay_outage_reaches_every_waiter(self, gated_idp):
+        idp = gated_idp()
+        tasks = _start_refreshes(*["same.refresh"] * 2)
+        await _settle()
+        with patch("main._lookup_real_email", new=AsyncMock(side_effect=Exception("db down"))):
+            idp.gate.set()
+            responses = await asyncio.gather(*tasks)
+
+        assert [r.status_code for r in responses] == [503, 503]
+        assert all(json.loads(r.body)["error"] == "temporarily_unavailable" for r in responses)
+        assert len(idp.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_first_caller_does_not_fail_the_others(self, gated_idp):
+        idp = gated_idp()
+        first, *others = _start_refreshes(*["same.refresh"] * 3)
+        await _settle()
+
+        first.cancel()
+        await _settle()
+        assert len(m._refreshes_in_flight) == 1
+
+        idp.gate.set()
+        responses = await asyncio.gather(*others)
+
+        assert first.cancelled()
+        assert [r.status_code for r in responses] == [200, 200]
+        assert len(idp.posts) == 1
+        assert m._refreshes_in_flight == {}
 
 
 class TestMpassLogin:
