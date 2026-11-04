@@ -1,4 +1,6 @@
-"""Bounded request-body reading for the adapter's unauthenticated POST routes."""
+"""Bounded request-body reading and strict JSON decoding for the adapter's POST routes."""
+
+import json
 
 from starlette.requests import Request
 
@@ -27,3 +29,20 @@ async def read_body_within(request: Request, limit: int) -> bytes:
             raise RequestTooLarge()
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def strict_json_loads(raw: bytes | str):
+    """json.loads that refuses duplicate object keys, so no two readers of the
+    same bytes can disagree on a value. Raises ValueError, also for nesting
+    deep enough to exhaust the parser's recursion limit."""
+    try:
+        return json.loads(raw, object_pairs_hook=_without_duplicate_keys)
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deeply") from exc
+
+
+def _without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key in JSON object")
+    return dict(pairs)
