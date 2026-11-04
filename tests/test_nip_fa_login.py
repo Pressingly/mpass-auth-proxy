@@ -774,7 +774,9 @@ def _is_test_client_request_line(record: logging.LogRecord) -> bool:
 
 
 class TestRevalidationErrorHandling:
-    def test_unexpected_error_from_the_refresh_call_is_not_swallowed(self, redis_store, clock, monkeypatch):
+    def test_unexpected_error_from_the_refresh_call_is_not_swallowed(
+        self, redis_store, clock, monkeypatch, fake_token_endpoint,
+    ):
         token = _signed_in(redis_store, clock)
         monkeypatch.setattr(m, "_post_refresh_grant", AsyncMock(side_effect=TypeError("bug")))
         clock.now += REVALIDATION_INTERVAL_SECONDS
