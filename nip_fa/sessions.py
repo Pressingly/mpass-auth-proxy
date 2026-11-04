@@ -115,6 +115,14 @@ class SessionStore:
             session_key(session_token), session.expires_at - now, encode_record(session_token, session)
         )
 
+    async def replace_existing(self, session_token: str, session: Session) -> bool:
+        """Overwrite the record only while it still exists, keeping its TTL, so
+        a session deleted mid-revalidation stays deleted."""
+        written = await self._redis_factory().set(
+            session_key(session_token), encode_record(session_token, session), xx=True, keepttl=True
+        )
+        return bool(written)
+
     async def load(self, session_token: str) -> Session | None:
         raw = await self._redis_factory().get(session_key(session_token))
         if not raw:
@@ -181,7 +189,9 @@ class SessionService:
             refresh_token=rotated_refresh_token or session.refresh_token,
             revalidated_at=now,
         )
-        await self._store.put(session_token, renewed, now)
+        if not await self._store.replace_existing(session_token, renewed):
+            logger.warning("nip-fa: session deleted during revalidation for mpass_id=%s", sub)
+            return SessionLookup(LookupStatus.ENDED)
         logger.info("nip-fa: session revalidated for mpass_id=%s", sub)
         return SessionLookup(LookupStatus.FOUND, renewed, outcome)
 

@@ -53,6 +53,14 @@ class _RecordingRedis:
         self.values[key] = value
         self.ttls[key] = ttl
 
+    async def set(self, key, value, *, xx=False, keepttl=False):
+        if xx and key not in self.values:
+            return None
+        self.values[key] = value
+        if not keepttl:
+            self.ttls.pop(key, None)
+        return True
+
     async def delete(self, key):
         self.values.pop(key, None)
         self.ttls.pop(key, None)
@@ -558,9 +566,26 @@ class TestSessionRevalidation:
         renewed = decode_record(token, raw)
         assert renewed.refresh_token == _ROTATED_REFRESH_TOKEN
         assert renewed.revalidated_at == clock.now
-        assert redis_store.ttls[session_key(token)] == (
-            m._BUZZ_ADAPTER_CONFIG.session_ttl_seconds - REVALIDATION_INTERVAL_SECONDS
-        )
+        assert redis_store.ttls[session_key(token)] == m._BUZZ_ADAPTER_CONFIG.session_ttl_seconds
+
+    def test_session_deleted_during_revalidation_is_not_resurrected(
+        self, redis_store, clock, monkeypatch, fake_token_endpoint
+    ):
+        token = _signed_in(redis_store, clock)
+
+        async def revoked_while_refreshing(self_inner, url, **kwargs):
+            await redis_store.delete(session_key(token))
+            return httpx.Response(200, json={
+                "access_token": "new.access", "id_token": "new.id", "refresh_token": _ROTATED_REFRESH_TOKEN,
+            })
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", revoked_while_refreshing)
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+
+        response = _session(token)
+        assert response.status_code == 401
+        assert response.json() == {"error": "session_expired"}
+        assert session_key(token) not in redis_store.values
 
     def test_invalid_grant_ends_the_session(self, redis_store, clock, monkeypatch, fake_token_endpoint):
         token = _signed_in(redis_store, clock)
