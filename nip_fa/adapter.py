@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict
 from typing import Protocol
 
+import asyncpg
 from fastapi import APIRouter
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -14,10 +15,20 @@ from starlette.responses import Response
 
 from .bodies import RequestTooLarge, read_body_within
 from .config import AdapterConfig
+from .identities import (
+    IdentityKeyService,
+    IdentityStore,
+    KeyIssuance,
+    KeyIssuanceStatus,
+    LaunchpadIdentityStore,
+)
 from .responses import (
     adapter_json,
     adapter_redirect,
+    authorization_denied,
+    binding_mismatch,
     invalid_request,
+    issuance_unavailable,
     request_too_large,
     session_expired,
     session_required,
@@ -27,6 +38,7 @@ from .sessions import (
     Identity,
     IdentityProvider,
     LookupStatus,
+    Revalidation,
     Session,
     SessionLookup,
     SessionService,
@@ -64,6 +76,9 @@ class PlatformGateway(IdentityProvider, Protocol):
         """Raises IdentityUnavailable, or EmailVerificationRequired when the
         platform requires a verified email and the user has none."""
 
+    async def launchpad_pool(self) -> asyncpg.Pool:
+        """Raises IdentityStoreUnavailable when the launchpad database cannot be reached."""
+
 
 def _code_key(code: str) -> str:
     return _CODE_KEY_PREFIX + hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -91,6 +106,17 @@ def session_view(session: Session) -> dict:
     return view
 
 
+def _issuance_response(issuance: KeyIssuance) -> Response:
+    if issuance.status is KeyIssuanceStatus.REVOKED:
+        return authorization_denied()
+    if issuance.status is KeyIssuanceStatus.BINDING_MISMATCH:
+        return binding_mismatch()
+    if issuance.status is KeyIssuanceStatus.UNAVAILABLE:
+        return issuance_unavailable()
+    keypair = issuance.keypair
+    return adapter_json({"nostr_pubkey": keypair.pubkey_hex, "secret_key": keypair.secret_key_hex})
+
+
 def _single_bearer_token(headers: Headers) -> tuple[str | None, Response | None]:
     values = headers.getlist("authorization")
     if not values:
@@ -107,11 +133,22 @@ def _single_bearer_token(headers: Headers) -> tuple[str | None, Response | None]
 
 
 class NipFaAdapter:
-    def __init__(self, config: AdapterConfig, gateway: PlatformGateway, clock=time.time):
+    def __init__(
+        self,
+        config: AdapterConfig,
+        gateway: PlatformGateway,
+        clock=time.time,
+        identity_store: IdentityStore | None = None,
+    ):
         self._config = config
         self._gateway = gateway
         self.sealer = RecordSealer(config.identity_master_secret)
         self.sessions = SessionService(SessionStore(gateway.redis, self.sealer), gateway, clock)
+        self.identity_keys = IdentityKeyService(
+            config.identity_master_secret,
+            config.identity_salt,
+            identity_store or LaunchpadIdentityStore(gateway.launchpad_pool),
+        )
         self.router = self._build_router()
 
     def _build_router(self) -> APIRouter:
@@ -119,6 +156,7 @@ class NipFaAdapter:
         router.add_api_route("/v1/login/start", self.start_login, methods=["GET"])
         router.add_api_route("/v1/login/exchange", self.exchange_code, methods=["POST"])
         router.add_api_route("/v1/session", self.check_session, methods=["GET"])
+        router.add_api_route("/v1/identity/key", self.issue_identity_key, methods=["GET"])
         return router
 
     def owns(self, bridge_data: dict) -> bool:
@@ -228,3 +266,14 @@ class NipFaAdapter:
         if denial is not None:
             return denial
         return adapter_json(session_view(lookup.session))
+
+    async def issue_identity_key(self, request: Request) -> Response:
+        """Our custodial extension to NIP-FA: the platform-held Nostr key for the
+        session's mPass ID. Stricter than the session check: a session whose
+        hourly revalidation could not reach the IdP gets no key."""
+        lookup, denial = await self.authenticate(request.headers)
+        if denial is not None:
+            return denial
+        if lookup.revalidation is Revalidation.UNAVAILABLE:
+            return issuance_unavailable()
+        return _issuance_response(await self.identity_keys.issue(lookup.session.identity))

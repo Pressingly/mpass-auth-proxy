@@ -18,6 +18,7 @@ from .adapter import (
     PlatformGateway,
 )
 from .config import AdapterConfig, AdapterConfigError
+from .identities import IdentityStoreUnavailable
 from .sessions import IdpUnavailable
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "AdapterConfig",
     "AdapterConfigError",
     "EmailVerificationRequired",
+    "IdentityStoreUnavailable",
     "IdentityUnavailable",
     "IdpUnavailable",
     "NipFaAdapter",

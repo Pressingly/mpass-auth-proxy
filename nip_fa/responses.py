@@ -25,8 +25,20 @@ def session_expired() -> JSONResponse:
     return denial(401, "session_expired")
 
 
+def authorization_denied() -> JSONResponse:
+    return denial(403, "authorization_denied")
+
+
+def binding_mismatch() -> JSONResponse:
+    return denial(403, "binding_mismatch")
+
+
 def request_too_large() -> JSONResponse:
     return denial(413, "request_too_large")
+
+
+def issuance_unavailable() -> JSONResponse:
+    return denial(503, "issuance_unavailable")
 
 
 def adapter_redirect(url: str) -> RedirectResponse:

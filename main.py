@@ -1267,6 +1267,12 @@ class _PlatformGateway:
             raise nip_fa.EmailVerificationRequired()
         return verified_email
 
+    async def launchpad_pool(self) -> asyncpg.Pool:
+        try:
+            return await _get_launchpad_pool()
+        except Exception as exc:
+            raise nip_fa.IdentityStoreUnavailable() from exc
+
     async def refresh_grant(self, refresh_token: str) -> httpx.Response:
         try:
             await _get_token_endpoint()
