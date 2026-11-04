@@ -26,6 +26,8 @@ import uuid as _uuid
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
+import nip_fa
+
 # Configure the root logger. uvicorn's --log-level only configures uvicorn's own
 # loggers ("uvicorn", "uvicorn.error", "uvicorn.access"); this module's logger
 # propagates to root, which otherwise has no handler and falls back to
@@ -133,6 +135,8 @@ def _derive_portal_url() -> str:
     return f"{parsed.scheme}://{host}/"
 
 PORTAL_URL: str = _derive_portal_url()
+
+_BUZZ_ADAPTER_CONFIG: nip_fa.AdapterConfig = nip_fa.AdapterConfig.from_env(os.environ)
 
 # ---------------------------------------------------------------------------
 # App + Redis
@@ -918,7 +922,12 @@ async def _bridge_callback_impl(request: Request) -> Response:
         await _validate_corporate_id(access_token)
     except CorporateIdMismatch as exc:
         logger.warning("bridge_callback: corporate-id check failed: %s", exc)
+        if _is_buzz_login(bridge_data):
+            return _buzz_adapter.deny_login(bridge_data)
         return _portal_redirect_with_error("access_denied", reason=exc.reason)
+
+    if _is_buzz_login(bridge_data):
+        return await _buzz_adapter.complete_login(bridge_data, claims, refresh_token)
 
     if not refresh_token:
         logger.warning("bridge_callback: Moneta did not provide refresh_token — session refresh will not work")
@@ -1225,3 +1234,51 @@ async def _exchange_refresh_token(refresh_token: str) -> _TokenOutcome:
         "refresh_token": token_body.get("refresh_token") or refresh_token,
     }
     return _json_outcome(body, sub=_id_token_sub(token_body["id_token"]))
+
+
+# ---------------------------------------------------------------------------
+# Buzz NIP-FA adapter (see nip_fa/__init__.py)
+# ---------------------------------------------------------------------------
+
+
+class _PlatformGateway:
+    """nip_fa.PlatformGateway over this module. Names resolve at call time, so
+    the adapter always uses the same Redis client and helpers as the routes."""
+
+    def redis(self):
+        return redis_client
+
+    async def begin_moneta_login(self, state: str, bridge_data: dict) -> Response:
+        return await _begin_moneta_login(state, bridge_data)
+
+    async def resolve_email(self, claims: dict) -> str | None:
+        if not _EMAIL_CAPTURE_ENABLED:
+            return claims.get("email")
+        try:
+            return (await _apply_email_overlay(claims))["email"]
+        except EmailOverlayUnavailable as exc:
+            raise nip_fa.IdentityUnavailable() from exc
+
+    async def refresh_grant(self, refresh_token: str) -> httpx.Response:
+        return await _post_refresh_grant(refresh_token)
+
+    async def corporate_id_allowed(self, access_token: str) -> bool:
+        try:
+            await _validate_corporate_id(access_token)
+        except CorporateIdMismatch as exc:
+            logger.warning("nip-fa: corporate-id check failed: %s", exc)
+            return False
+        return True
+
+
+_buzz_adapter: nip_fa.NipFaAdapter | None = (
+    nip_fa.NipFaAdapter(_BUZZ_ADAPTER_CONFIG, _PlatformGateway())
+    if _BUZZ_ADAPTER_CONFIG.enabled
+    else None
+)
+if _buzz_adapter is not None:
+    app.include_router(_buzz_adapter.router)
+
+
+def _is_buzz_login(bridge_data: dict) -> bool:
+    return _buzz_adapter is not None and _buzz_adapter.owns(bridge_data)
