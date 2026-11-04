@@ -2,7 +2,6 @@
 
 import enum
 import hashlib
-import json
 import logging
 import secrets
 from dataclasses import asdict, dataclass, replace
@@ -12,7 +11,7 @@ from typing import Protocol
 import httpx
 import jwt
 
-from .sealing import SESSION_REFRESH_TOKEN, seal, unseal
+from .sealing import SESSION_RECORD, RecordSealer
 
 logger = logging.getLogger(__name__)
 
@@ -89,43 +88,36 @@ def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def encode_record(session_token: str, session: Session) -> str:
-    return json.dumps({
-        "identity": asdict(session.identity),
-        "sealed_refresh_token": seal(session_token, session.refresh_token, SESSION_REFRESH_TOKEN),
-        "expires_at": session.expires_at,
-        "revalidated_at": session.revalidated_at,
-    })
+def encode_record(sealer: RecordSealer, session_token: str, session: Session) -> str:
+    return sealer.seal(session_token, asdict(session), SESSION_RECORD)
 
 
-def decode_record(session_token: str, raw: str) -> Session | None:
+def decode_record(sealer: RecordSealer, session_token: str, raw: str) -> Session | None:
     """The session, or None when the record cannot be trusted for this token."""
-    data = json.loads(raw)
-    refresh_token = unseal(session_token, data["sealed_refresh_token"], SESSION_REFRESH_TOKEN)
-    if refresh_token is None:
+    data = sealer.unseal(session_token, raw, SESSION_RECORD)
+    if data is None:
         return None
-    return Session(
-        identity=Identity(**data["identity"]),
-        refresh_token=refresh_token,
-        expires_at=data["expires_at"],
-        revalidated_at=data["revalidated_at"],
-    )
+    return Session(**{**data, "identity": Identity(**data["identity"])})
 
 
 class SessionStore:
-    def __init__(self, redis_factory):
+    def __init__(self, redis_factory, sealer: RecordSealer):
         self._redis_factory = redis_factory
+        self._sealer = sealer
+
+    def _encode(self, session_token: str, session: Session) -> str:
+        return encode_record(self._sealer, session_token, session)
 
     async def put(self, session_token: str, session: Session, now: int) -> None:
         await self._redis_factory().setex(
-            session_key(session_token), session.expires_at - now, encode_record(session_token, session)
+            session_key(session_token), session.expires_at - now, self._encode(session_token, session)
         )
 
     async def replace_existing(self, session_token: str, session: Session) -> bool:
         """Overwrite the record only while it still exists, keeping its TTL, so
         a session deleted mid-revalidation stays deleted."""
         written = await self._redis_factory().set(
-            session_key(session_token), encode_record(session_token, session), xx=True, keepttl=True
+            session_key(session_token), self._encode(session_token, session), xx=True, keepttl=True
         )
         return bool(written)
 
@@ -133,7 +125,7 @@ class SessionStore:
         raw = await self._redis_factory().get(session_key(session_token))
         if not raw:
             return None
-        session = decode_record(session_token, raw)
+        session = decode_record(self._sealer, session_token, raw)
         if session is None:
             logger.warning("nip-fa: session record failed to unseal; treating as no session")
         return session

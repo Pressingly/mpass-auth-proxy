@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -11,8 +12,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main as m
-from nip_fa.sealing import LOGIN_CODE_REFRESH_TOKEN, SESSION_REFRESH_TOKEN, seal, unseal
-from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, decode_record, session_key
+from nip_fa.sealing import LOGIN_CODE_RECORD, SESSION_RECORD, RecordSealer
+from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, Identity, Session, decode_record, encode_record, session_key
 from nip_fa.bodies import RequestTooLarge, read_body_within
 from nip_fa.validation import b64url_sha256, is_loopback_callback, is_sha256_challenge, with_query_params
 from tests.test_main import (  # noqa: F401  (autouse fixtures apply by import)
@@ -37,6 +38,15 @@ _COGNITO_SUB = "cognito-sub-uuid-5678"
 _REFRESH_TOKEN = "refresh-token-NEVER-LOG-abcdef"
 _ROTATED_REFRESH_TOKEN = "rotated-refresh-NEVER-LOG-ghijk"
 _T0 = 1_800_000_000
+_OTHER_MASTER_SECRET = bytes.fromhex("cd" * 32)
+
+
+def _sealer() -> RecordSealer:
+    return m._buzz_adapter.sealer
+
+
+def _stored_session(redis_store, token) -> Session:
+    return decode_record(_sealer(), token, redis_store.values[session_key(token)])
 
 
 class _RecordingRedis:
@@ -323,12 +333,15 @@ class TestLoginCallback:
         assert code not in code_keys[0]
         assert 60 <= redis_store.ttls[code_keys[0]] <= 120
 
-    def test_code_record_holds_no_plaintext_refresh_token(self, redis_store, clock):
+    def test_code_record_is_sealed_whole(self, redis_store, clock):
         code = _login_code()
         raw = redis_store.values[redis_store.keys_with_prefix("nip_fa_code:")[0]]
-        assert _REFRESH_TOKEN not in raw
-        assert "refresh_token" not in json.loads(raw)
-        assert unseal(code, json.loads(raw)["sealed_refresh_token"], LOGIN_CODE_REFRESH_TOKEN) == _REFRESH_TOKEN
+        for plaintext in (_REFRESH_TOKEN, _MPASS_ID, _COGNITO_SUB, _HANDOFF_CHALLENGE, "jane.doe@corp.example"):
+            assert plaintext not in raw
+        record = _sealer().unseal(code, raw, LOGIN_CODE_RECORD)
+        assert record["refresh_token"] == _REFRESH_TOKEN
+        assert record["handoff_challenge"] == _HANDOFF_CHALLENGE
+        assert record["identity"]["sub"] == _MPASS_ID
 
     def test_preserves_existing_return_to_query(self, redis_store, clock):
         return_to = "http://[::1]:4000/cb?client=buzz%20desktop&flag"
@@ -400,9 +413,9 @@ class TestCodeExchange:
     def test_session_subject_is_the_mpass_id(self, redis_store, clock):
         token = _exchange(_login_code()).json()["session_token"]
 
-        record = json.loads(redis_store.values[session_key(token)])
-        assert record["identity"]["sub"] == _MPASS_ID
-        assert record["identity"]["cognito_sub"] == _COGNITO_SUB
+        identity = _stored_session(redis_store, token).identity
+        assert identity.sub == _MPASS_ID
+        assert identity.cognito_sub == _COGNITO_SUB
 
     def test_session_is_stored_under_token_hash_with_matching_ttl(self, redis_store, clock):
         token = _exchange(_login_code()).json()["session_token"]
@@ -526,33 +539,83 @@ class TestEmailVerification:
         assert body["profile_projection"] is None
 
 
-class TestRefreshTokenSealing:
-    def test_stored_record_holds_no_plaintext_refresh_token(self, redis_store, clock):
+_RECORD = {"refresh_token": _REFRESH_TOKEN}
+
+
+class TestRecordSealing:
+    def test_stored_session_record_is_sealed_whole(self, redis_store, clock):
         token = _signed_in(redis_store, clock)
 
         raw = redis_store.values[session_key(token)]
-        assert _REFRESH_TOKEN not in raw
-        assert "refresh_token" not in json.loads(raw)
-        assert decode_record(token, raw).refresh_token == _REFRESH_TOKEN
+        for plaintext in (_REFRESH_TOKEN, _MPASS_ID, _COGNITO_SUB, "jane.doe@corp.example", "expires_at"):
+            assert plaintext not in raw
+        assert _stored_session(redis_store, token).refresh_token == _REFRESH_TOKEN
 
     def test_seal_round_trips_with_a_fresh_nonce_each_time(self):
-        first = seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN)
-        second = seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN)
+        sealer = _sealer()
+        first = sealer.seal("token-a", _RECORD, SESSION_RECORD)
+        second = sealer.seal("token-a", _RECORD, SESSION_RECORD)
         assert first != second
-        assert unseal("token-a", first, SESSION_REFRESH_TOKEN) == _REFRESH_TOKEN
-        assert unseal("token-a", second, SESSION_REFRESH_TOKEN) == _REFRESH_TOKEN
+        assert sealer.unseal("token-a", first, SESSION_RECORD) == _RECORD
+        assert sealer.unseal("token-a", second, SESSION_RECORD) == _RECORD
 
-    @pytest.mark.parametrize("sealed", ["", "not base64!", "AAAA", None])
+    @pytest.mark.parametrize("sealed", ["", "not base64!", "AAAA", None, json.dumps(_RECORD)])
     def test_unseal_fails_closed_on_garbage(self, sealed):
-        assert unseal("token-a", sealed, SESSION_REFRESH_TOKEN) is None
+        assert _sealer().unseal("token-a", sealed, SESSION_RECORD) is None
 
     def test_unseal_with_another_token_fails(self):
-        assert unseal("token-b", seal("token-a", _REFRESH_TOKEN, SESSION_REFRESH_TOKEN), SESSION_REFRESH_TOKEN) is None
+        sealer = _sealer()
+        assert sealer.unseal("token-b", sealer.seal("token-a", _RECORD, SESSION_RECORD), SESSION_RECORD) is None
 
     def test_labels_do_not_open_each_other(self):
-        sealed = seal("secret", _REFRESH_TOKEN, LOGIN_CODE_REFRESH_TOKEN)
-        assert unseal("secret", sealed, SESSION_REFRESH_TOKEN) is None
-        assert unseal("secret", sealed, LOGIN_CODE_REFRESH_TOKEN) == _REFRESH_TOKEN
+        sealer = _sealer()
+        sealed = sealer.seal("secret", _RECORD, LOGIN_CODE_RECORD)
+        assert sealer.unseal("secret", sealed, SESSION_RECORD) is None
+        assert sealer.unseal("secret", sealed, LOGIN_CODE_RECORD) == _RECORD
+
+    def test_another_master_secret_cannot_open_or_forge(self):
+        foreign = RecordSealer(_OTHER_MASTER_SECRET)
+        assert foreign.unseal("token-a", _sealer().seal("token-a", _RECORD, SESSION_RECORD), SESSION_RECORD) is None
+        assert _sealer().unseal("token-a", foreign.seal("token-a", _RECORD, SESSION_RECORD), SESSION_RECORD) is None
+
+    def test_sealer_repr_hides_its_key_material(self):
+        assert repr(_sealer()) == "RecordSealer(<redacted>)"
+
+    @pytest.mark.parametrize("forge", ["plaintext_json", "foreign_master"])
+    def test_forged_session_for_an_invented_token_is_refused(self, redis_store, clock, forge):
+        invented = "attacker-chosen-session-token-0123456789abcdef"
+        session = Session(
+            identity=Identity(sub="victim-mpass-id", cognito_sub="x", email="victim@corp.example"),
+            refresh_token="r",
+            expires_at=_T0 + 3600,
+            revalidated_at=_T0,
+        )
+        forged = {
+            "plaintext_json": json.dumps({
+                "identity": {"sub": "victim-mpass-id", "cognito_sub": "x", "email": "victim@corp.example"},
+                "refresh_token": "r", "expires_at": _T0 + 3600, "revalidated_at": _T0,
+            }),
+            "foreign_master": encode_record(RecordSealer(_OTHER_MASTER_SECRET), invented, session),
+        }[forge]
+        redis_store.values[session_key(invented)] = forged
+
+        response = _session(invented)
+        assert response.status_code == 401
+        assert response.json() == {"error": "session_required"}
+
+    def test_forged_login_code_is_refused(self, redis_store, clock):
+        invented_code = "attacker-chosen-login-code-0123456789abcdef"
+        forged = RecordSealer(_OTHER_MASTER_SECRET).seal(invented_code, {
+            "handoff_challenge": _HANDOFF_CHALLENGE,
+            "identity": {"sub": "victim-mpass-id", "cognito_sub": "x", "email": None},
+            "refresh_token": "r",
+        }, LOGIN_CODE_RECORD)
+        redis_store.values["nip_fa_code:" + hashlib.sha256(invented_code.encode()).hexdigest()] = forged
+
+        response = _exchange(invented_code)
+        assert response.status_code == 400
+        assert response.json() == {"error": "invalid_request"}
+        assert redis_store.keys_with_prefix("nip_fa_session:") == []
 
     def test_record_moved_under_another_token_is_not_trusted(self, redis_store, clock):
         victim = _signed_in(redis_store, clock)
@@ -677,7 +740,7 @@ class TestSessionRevalidation:
         assert posted["refresh_token"] == _REFRESH_TOKEN
         raw = redis_store.values[session_key(token)]
         assert _ROTATED_REFRESH_TOKEN not in raw
-        renewed = decode_record(token, raw)
+        renewed = decode_record(_sealer(), token, raw)
         assert renewed.refresh_token == _ROTATED_REFRESH_TOKEN
         assert renewed.revalidated_at == clock.now
         assert redis_store.ttls[session_key(token)] == m._BUZZ_ADAPTER_CONFIG.session_ttl_seconds

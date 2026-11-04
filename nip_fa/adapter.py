@@ -1,7 +1,6 @@
 """NIP-FA browser login, code exchange and session check."""
 
 import hashlib
-import json
 import logging
 import secrets
 import time
@@ -23,7 +22,7 @@ from .responses import (
     session_expired,
     session_required,
 )
-from .sealing import LOGIN_CODE_REFRESH_TOKEN, seal, unseal
+from .sealing import LOGIN_CODE_RECORD, RecordSealer
 from .sessions import (
     Identity,
     IdentityProvider,
@@ -111,7 +110,8 @@ class NipFaAdapter:
     def __init__(self, config: AdapterConfig, gateway: PlatformGateway, clock=time.time):
         self._config = config
         self._gateway = gateway
-        self.sessions = SessionService(SessionStore(gateway.redis), gateway, clock)
+        self.sealer = RecordSealer(config.identity_master_secret)
+        self.sessions = SessionService(SessionStore(gateway.redis, self.sealer), gateway, clock)
         self.router = self._build_router()
 
     def _build_router(self) -> APIRouter:
@@ -173,9 +173,10 @@ class NipFaAdapter:
         record = {
             "handoff_challenge": bridge_data["handoff_challenge"],
             "identity": asdict(identity),
-            "sealed_refresh_token": seal(code, refresh_token, LOGIN_CODE_REFRESH_TOKEN),
+            "refresh_token": refresh_token,
         }
-        await self._gateway.redis().setex(_code_key(code), CODE_TTL_SECONDS, json.dumps(record))
+        sealed = self.sealer.seal(code, record, LOGIN_CODE_RECORD)
+        await self._gateway.redis().setex(_code_key(code), CODE_TTL_SECONDS, sealed)
         logger.info("nip-fa: login code issued for mpass_id=%s", mpass_id)
         return adapter_redirect(with_query_params(bridge_data["return_to"], {"code": code}))
 
@@ -194,18 +195,17 @@ class NipFaAdapter:
         if not stored:
             logger.warning("nip-fa: exchange with unknown or expired code")
             return invalid_request()
-        record = json.loads(stored)
+        record = self.sealer.unseal(exchange.code, stored, LOGIN_CODE_RECORD)
+        if record is None:
+            logger.error("nip-fa: login code record failed to unseal; code burned")
+            return invalid_request()
         identity = Identity(**record["identity"])
         if not challenge_matches(exchange.handoff_secret, record["handoff_challenge"]):
             logger.warning("nip-fa: handoff secret mismatch for mpass_id=%s; code burned", identity.sub)
             return invalid_request()
-        refresh_token = unseal(exchange.code, record["sealed_refresh_token"], LOGIN_CODE_REFRESH_TOKEN)
-        if refresh_token is None:
-            logger.error("nip-fa: login code record failed to unseal for mpass_id=%s", identity.sub)
-            return invalid_request()
 
         session_token, session = await self.sessions.open(
-            identity, refresh_token, self._config.session_ttl_seconds
+            identity, record["refresh_token"], self._config.session_ttl_seconds
         )
         logger.info("nip-fa: session opened for mpass_id=%s", identity.sub)
         return adapter_json({"session_token": session_token, **session_view(session)})
