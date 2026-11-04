@@ -1266,7 +1266,7 @@ class _PlatformGateway:
         try:
             await _validate_corporate_id(access_token)
         except CorporateIdMismatch as exc:
-            logger.warning("nip-fa: corporate-id check failed: %s", exc)
+            logger.warning("nip-fa: corporate-id check failed: reason=%s", exc.reason or "mismatch")
             return False
         return True
 

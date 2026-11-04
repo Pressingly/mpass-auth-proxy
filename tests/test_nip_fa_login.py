@@ -642,6 +642,33 @@ class TestCredentialsNeverLogged:
             assert secret not in logged
 
 
+    def test_corporate_id_revalidation_failure_does_not_log_the_username(
+        self, redis_store, clock, monkeypatch, fake_token_endpoint, caplog
+    ):
+        token = _signed_in(redis_store, clock)
+        alias_email = "alice.alias@corp.example"
+        refused_access_token = _make_jwt_with_kid(
+            _cognito_access_claims(username=alias_email, **{"custom:corporate_id": "other-corp"}), kid="k1"
+        )
+        monkeypatch.setattr(
+            httpx.AsyncClient, "post",
+            _idp_refresh_response(body={"access_token": refused_access_token, "id_token": "new.id"}),
+        )
+        clock.now += REVALIDATION_INTERVAL_SECONDS
+        refused_claims = _cognito_access_claims(username=alias_email, **{"custom:corporate_id": "other-corp"})
+
+        with caplog.at_level(logging.DEBUG), \
+             patch.object(m, "SMB_CORPORATE_ID", "corp-uuid-1234"), \
+             patch("main._get_jwks", new_callable=AsyncMock, return_value={"keys": [{"kid": "k1"}]}), \
+             patch("main.PyJWK.from_dict", return_value=_FakePyJWK()), \
+             patch("main.jwt.decode", return_value=refused_claims):
+            assert _session(token).json() == {"error": "session_expired"}
+
+        adapter_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("nip-fa:")]
+        assert any("reason=wrong_organization" in line for line in adapter_lines)
+        assert not any(alias_email in line for line in adapter_lines)
+
+
 class TestExistingFlowUnaffected:
     def test_authorize_flow_still_issues_bridge_code(self, redis_store):
         authorize = client.get(
