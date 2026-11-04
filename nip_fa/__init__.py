@@ -10,13 +10,20 @@ outside that prefix would fall through to the oauth2-proxy catch-all and answer
 the desktop's non-redirecting HTTP client with a 302.
 """
 
-from .adapter import ROUTE_PREFIX, IdentityUnavailable, NipFaAdapter, PlatformGateway
+from .adapter import (
+    ROUTE_PREFIX,
+    EmailVerificationRequired,
+    IdentityUnavailable,
+    NipFaAdapter,
+    PlatformGateway,
+)
 from .config import AdapterConfig, AdapterConfigError
 
 __all__ = [
     "ROUTE_PREFIX",
     "AdapterConfig",
     "AdapterConfigError",
+    "EmailVerificationRequired",
     "IdentityUnavailable",
     "NipFaAdapter",
     "PlatformGateway",

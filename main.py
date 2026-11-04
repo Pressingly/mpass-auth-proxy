@@ -578,6 +578,22 @@ async def _apply_email_overlay(claims: dict) -> dict:
     on that claim -- so a one-second database hiccup silently turns one human
     into two principals, intermittently. A 503 is recoverable; a split identity
     is not."""
+    synthetic_id, real_email = await _lookup_verified_email(claims)
+    new_claims = dict(claims)
+    new_claims["preferred_username"] = synthetic_id
+    if real_email:
+        new_claims["email"] = real_email
+        logger.info("overlay: applied real_email for sid=%s", synthetic_id)
+    else:
+        new_claims["email"] = f"{synthetic_id}@{_SYNTHETIC_EMAIL_DOMAIN}"
+        logger.info("overlay: set synthetic email for sid=%s", synthetic_id)
+    return new_claims
+
+
+async def _lookup_verified_email(claims: dict) -> tuple[str, str | None]:
+    """(synthetic_id, the user's verified real email or None when there is no
+    verified row). Raises EmailOverlayUnavailable when the answer is unknown,
+    for the reasons given on _apply_email_overlay."""
     # cognito:username only. The `sub` fallback that used to sit here mixed two
     # claim namespaces in a single keyspace with nothing recording which one a
     # given row came from, so two users from different claim sources could
@@ -606,15 +622,7 @@ async def _apply_email_overlay(claims: dict) -> dict:
             synthetic_id, type(exc).__name__, exc,
         )
         raise EmailOverlayUnavailable(str(exc)) from exc
-    new_claims = dict(claims)
-    new_claims["preferred_username"] = synthetic_id
-    if real_email:
-        new_claims["email"] = real_email
-        logger.info("overlay: applied real_email for sid=%s", synthetic_id)
-    else:
-        new_claims["email"] = f"{synthetic_id}@{_SYNTHETIC_EMAIL_DOMAIN}"
-        logger.info("overlay: set synthetic email for sid=%s", synthetic_id)
-    return new_claims
+    return synthetic_id, real_email
 
 
 # ---------------------------------------------------------------------------
@@ -1255,9 +1263,12 @@ class _PlatformGateway:
         if not _EMAIL_CAPTURE_ENABLED:
             return claims.get("email")
         try:
-            return (await _apply_email_overlay(claims))["email"]
+            _, verified_email = await _lookup_verified_email(claims)
         except EmailOverlayUnavailable as exc:
             raise nip_fa.IdentityUnavailable() from exc
+        if not verified_email:
+            raise nip_fa.EmailVerificationRequired()
+        return verified_email
 
     async def refresh_grant(self, refresh_token: str) -> httpx.Response:
         return await _post_refresh_grant(refresh_token)

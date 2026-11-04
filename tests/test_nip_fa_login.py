@@ -125,7 +125,10 @@ def _id_claims(**overrides):
     return {key: value for key, value in claims.items() if value is not None}
 
 
-def _callback(state, *, id_claims=None, access_claims=None, corporate_id="", refresh_token=_REFRESH_TOKEN):
+def _callback(
+    state, *, id_claims=None, access_claims=None, corporate_id="", refresh_token=_REFRESH_TOKEN,
+    real_email="jane.doe@corp.example",
+):
     id_claims = id_claims or _id_claims()
     access_claims = access_claims or _cognito_access_claims()
     id_token = _make_jwt_with_kid(id_claims, kid="k1")
@@ -137,7 +140,7 @@ def _callback(state, *, id_claims=None, access_claims=None, corporate_id="", ref
          patch("main._get_jwks", new_callable=AsyncMock) as mock_jwks, \
          patch("main.PyJWK.from_dict", return_value=_FakePyJWK()), \
          patch("main.jwt.decode", side_effect=[id_claims, access_claims]), \
-         patch("main._lookup_real_email", new=AsyncMock(return_value="jane.doe@corp.example")):
+         patch("main._lookup_real_email", new=AsyncMock(return_value=real_email)):
         mock_jwks.return_value = {"keys": [{"kid": "k1", "kty": "RSA"}]}
         return client.get(
             "/mpass-callback",
@@ -327,7 +330,7 @@ class TestLoginCallback:
 
     def test_email_overlay_outage_fails_closed(self, redis_store, clock):
         start = _start()
-        with patch("main._apply_email_overlay", side_effect=m.EmailOverlayUnavailable("down")):
+        with patch("main._lookup_verified_email", side_effect=m.EmailOverlayUnavailable("down")):
             response = _callback(_bridge_state(start))
 
         assert parse_qs(urlsplit(response.headers["location"]).query) == {"error": ["temporarily_unavailable"]}
@@ -433,29 +436,44 @@ class TestCodeExchange:
         )
         assert response.status_code == 400
 
-    def test_unverified_user_gets_synthetic_email_projection(self, redis_store, clock):
-        start = _start()
-        with patch("main._lookup_real_email", new=AsyncMock(return_value=None)):
-            state = _bridge_state(start)
-            id_claims, access_claims = _id_claims(), _cognito_access_claims()
-            with patch("main._get_jwks", new_callable=AsyncMock, return_value={"keys": [{"kid": "k1"}]}), \
-                 patch("main.PyJWK.from_dict", return_value=_FakePyJWK()), \
-                 patch("main.jwt.decode", side_effect=[id_claims, access_claims]):
-                response = client.get(
-                    "/mpass-callback",
-                    params={
-                        "id_token": _make_jwt_with_kid(id_claims, kid="k1"),
-                        "access_token": _make_jwt_with_kid(access_claims, kid="k1"),
-                        "refresh_token": _REFRESH_TOKEN,
-                    },
-                    cookies={"mpass_bridge": state},
-                    follow_redirects=False,
-                )
-        code = parse_qs(urlsplit(response.headers["location"]).query)["code"][0]
 
-        body = _exchange(code).json()
-        assert body["email"] == f"{_MPASS_ID}@synthetic.example.com"
-        assert body["profile_projection"] == {"username": _MPASS_ID, "display_name": _MPASS_ID}
+class TestEmailVerification:
+    def test_capture_on_refuses_a_user_without_a_verified_email(self, redis_store, clock, caplog):
+        start = _start()
+        with caplog.at_level(logging.INFO):
+            response = _callback(_bridge_state(start), real_email=None)
+
+        assert response.status_code == 302
+        assert response.headers["location"].startswith(_RETURN_TO + "?")
+        assert parse_qs(urlsplit(response.headers["location"]).query) == {
+            "error": ["access_denied"],
+            "error_description": ["email_verification_required"],
+        }
+        assert redis_store.keys_with_prefix("nip_fa_code:") == []
+        refusals = [r.getMessage() for r in caplog.records if "email_verification_required" in r.getMessage()]
+        assert refusals == [
+            f"nip-fa: login refused for mpass_id={_MPASS_ID} reason=email_verification_required"
+        ]
+
+    def test_capture_on_verified_user_gets_the_verified_email(self, redis_store, clock):
+        body = _exchange(_login_code(real_email="jane.doe@corp.example")).json()
+        assert body["email"] == "jane.doe@corp.example"
+
+    def test_capture_off_uses_the_id_token_email_without_a_lookup(self, redis_store, clock):
+        lookup = AsyncMock(side_effect=AssertionError("launchpad must not be queried"))
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False), patch("main._lookup_verified_email", new=lookup):
+            body = _exchange(_login_code(id_claims=_id_claims(email="jane@corp.example"))).json()
+
+        lookup.assert_not_awaited()
+        assert body["email"] == "jane@corp.example"
+        assert body["profile_projection"] == {"username": "jane", "display_name": "jane"}
+
+    def test_capture_off_drops_cognitos_placeholder_email(self, redis_store, clock):
+        with patch.object(m, "_EMAIL_CAPTURE_ENABLED", False):
+            body = _exchange(_login_code()).json()
+
+        assert "email" not in body
+        assert body["profile_projection"] is None
 
 
 class TestRefreshTokenSealing:

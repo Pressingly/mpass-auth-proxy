@@ -47,6 +47,10 @@ class IdentityUnavailable(Exception):
     """The platform could not resolve the user's email right now."""
 
 
+class EmailVerificationRequired(Exception):
+    """The platform requires a verified email and this user has none yet."""
+
+
 class PlatformGateway(IdentityProvider, Protocol):
     """What the adapter needs from the host service. main.py implements it, so
     the Moneta, Cognito and launchpad logic stays in one place."""
@@ -55,7 +59,9 @@ class PlatformGateway(IdentityProvider, Protocol):
 
     async def begin_moneta_login(self, state: str, bridge_data: dict) -> Response: ...
 
-    async def resolve_email(self, claims: dict) -> str | None: ...
+    async def resolve_email(self, claims: dict) -> str | None:
+        """Raises IdentityUnavailable, or EmailVerificationRequired when the
+        platform requires a verified email and the user has none."""
 
 
 def _code_key(code: str) -> str:
@@ -129,8 +135,11 @@ class NipFaAdapter:
         response.headers.update({"Cache-Control": "no-store"})
         return response
 
-    def deny_login(self, bridge_data: dict, error: str = "access_denied") -> Response:
-        return adapter_redirect(with_query_params(bridge_data["return_to"], {"error": error}))
+    def deny_login(
+        self, bridge_data: dict, error: str = "access_denied", description: str | None = None
+    ) -> Response:
+        params = {"error": error, **({"error_description": description} if description else {})}
+        return adapter_redirect(with_query_params(bridge_data["return_to"], params))
 
     async def complete_login(self, bridge_data: dict, claims: dict, refresh_token: str) -> Response:
         """Called by /mpass-callback once the id_token is verified and the
@@ -147,6 +156,11 @@ class NipFaAdapter:
         except IdentityUnavailable:
             logger.error("nip-fa: email unavailable for mpass_id=%s; refusing login", mpass_id)
             return self.deny_login(bridge_data, "temporarily_unavailable")
+        except EmailVerificationRequired:
+            logger.warning(
+                "nip-fa: login refused for mpass_id=%s reason=email_verification_required", mpass_id
+            )
+            return self.deny_login(bridge_data, "access_denied", "email_verification_required")
 
         identity = Identity(
             sub=mpass_id,
