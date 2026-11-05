@@ -19,6 +19,7 @@ MAX_COMMAND_PRINCIPAL_BYTES = 2048
 _DEFAULT_MPASS_PROXY_ISSUER_URL = "http://mpass-auth-proxy:8000"
 
 _TRUTHY = {"1", "true", "yes"}
+_FALSY = {"0", "false", "no"}
 _MASTER_SECRET_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _SALT_PATTERN = re.compile(r"(?:[0-9a-fA-F]{2}){16,64}")
 _UNSAFE_URL_CHARACTERS = re.compile(r"[\s\\\x00-\x1f\x7f]")
@@ -51,6 +52,7 @@ class AgentConfig:
     command_principal: str
     grant_ttl_seconds: int = DEFAULT_AGENT_GRANT_TTL_SECONDS
     max_agents_per_user: int = DEFAULT_MAX_AGENTS_PER_USER
+    accept_legacy_client: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,20 @@ def _agent_config(environ: Mapping[str, str], public_origin: str, relay_urls: li
         command_principal=_command_principal(environ),
         grant_ttl_seconds=_agent_grant_ttl(environ),
         max_agents_per_user=_positive_int(environ, "BUZZ_MAX_AGENTS_PER_USER", DEFAULT_MAX_AGENTS_PER_USER),
+        accept_legacy_client=_accept_legacy_client(environ),
+    )
+
+
+def _accept_legacy_client(environ: Mapping[str, str]) -> bool:
+    """On unless set to a false value: the current buzz-app desktop enrolls
+    agents only in the legacy dialect."""
+    raw = environ.get("BUZZ_AGENTS_ACCEPT_LEGACY_CLIENT", "").strip().lower()
+    if raw in ("", *_TRUTHY):
+        return True
+    if raw in _FALSY:
+        return False
+    raise AdapterConfigError(
+        f"BUZZ_AGENTS_ACCEPT_LEGACY_CLIENT must be true or false, got {raw!r} — refusing to start."
     )
 
 
