@@ -19,6 +19,7 @@ from .agent_grants import (
     AgentGrantRequest,
     grant_hash,
     grant_response,
+    is_grant_token,
     new_grant_token,
     parse_agent_grant_form,
     parse_agent_revoke_form,
@@ -62,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_GRANT_RATE_LIMIT = 10
 AGENT_ASSERTION_RATE_LIMIT = 30
+AGENT_REVOKE_RATE_LIMIT = 10
 AGENT_RATE_WINDOW_SECONDS = 60
 
 Authenticate = Callable[[Headers], Awaitable[tuple[SessionLookup | None, Response | None]]]
@@ -169,6 +171,9 @@ class AgentRoutes:
         )
         self.assertion_rate_limiter = AssertionRateLimiter(
             redis_factory, AGENT_ASSERTION_RATE_LIMIT, AGENT_RATE_WINDOW_SECONDS, "nip_fa_agent_assertion_rate:"
+        )
+        self.revoke_rate_limiter = AssertionRateLimiter(
+            redis_factory, AGENT_REVOKE_RATE_LIMIT, AGENT_RATE_WINDOW_SECONDS, "nip_fa_agent_revoke_rate:"
         )
 
     async def issue_grant(self, request: Request) -> Response:
@@ -284,26 +289,30 @@ class AgentRoutes:
         assertion_request = parse_assertion_body(body.raw)
         if assertion_request is None:
             return invalid_request()
-        grant_or_denial = await self._usable_grant(token)
+        now = self._sessions.now()
+        grant_or_denial = await self._usable_grant(token, now)
         if isinstance(grant_or_denial, Response):
             return grant_or_denial
         grant, credential_key = grant_or_denial
         denial = await self._rate_limit_denial(self.assertion_rate_limiter, credential_key, grant.agent_pubkey)
         if denial is not None:
             return denial
-        now = self._sessions.now()
         denial = await self._assertion_denial(grant, body, assertion_request, now)
         if denial is not None:
             return denial
         return self._agent_assertion(grant, assertion_request.relay_url, now)
 
-    async def _usable_grant(self, token: str) -> tuple[StoredGrant, str] | Response:
+    async def _usable_grant(self, token: str, now: int) -> tuple[StoredGrant, str] | Response:
+        """`now` is read before the grant, so an assertion signed after a
+        concurrent revoke still expires within that revoke's relay deny."""
+        if not is_grant_token(token):
+            return invalid_grant(401)
         credential_key = grant_hash(token)
         try:
             grant = await self.store.grant(credential_key)
         except AgentStoreUnavailable:
             return issuance_unavailable()
-        reason = grant_refusal_reason(grant, self._sessions.now())
+        reason = grant_refusal_reason(grant, now)
         if reason is None:
             return grant, credential_key
         agent = grant.agent_pubkey if grant is not None else "-"
@@ -314,8 +323,8 @@ class AgentRoutes:
         self, grant: StoredGrant, body: _ProvenBody, assertion_request: AssertionRequest, now: int
     ) -> Response | None:
         result = _proof_signer(body.proof, self._agents.assertion_url, body.raw, now)
-        if isinstance(result, ProofFailure) or result.pubkey != grant.agent_pubkey:
-            reason = result.value if isinstance(result, ProofFailure) else "signer_is_not_agent_pubkey"
+        if isinstance(result, ProofFailure) or result.pubkey != assertion_request.nostr_pubkey:
+            reason = result.value if isinstance(result, ProofFailure) else "signer_is_not_nostr_pubkey"
             logger.warning(
                 "nip-fa: agent assertion refused agent=%s reason=invalid_proof detail=%s",
                 grant.agent_pubkey, reason,
@@ -355,6 +364,11 @@ class AgentRoutes:
         if self._agents is None:
             return agent_unsupported()
         lookup, denial = await self._authenticate(request.headers)
+        if denial is not None:
+            return denial
+        denial = await self._rate_limit_denial(
+            self.revoke_rate_limiter, lookup.record_key, lookup.session.identity.sub
+        )
         if denial is not None:
             return denial
         agent_pubkey = await self._read_revoke_form(request)

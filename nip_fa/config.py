@@ -14,6 +14,7 @@ MIN_ASSERTION_TTL_SECONDS = 30
 MAX_ASSERTION_TTL_SECONDS = 3600
 DEFAULT_AGENT_GRANT_TTL_SECONDS = 691_200
 DEFAULT_MAX_AGENTS_PER_USER = 5
+MAX_AGENT_GRANT_TTL_SECONDS = 2_592_000
 MAX_COMMAND_PRINCIPAL_BYTES = 2048
 _DEFAULT_MPASS_PROXY_ISSUER_URL = "http://mpass-auth-proxy:8000"
 
@@ -92,7 +93,7 @@ def _agent_config(environ: Mapping[str, str], public_origin: str, relay_urls: li
         assertion_url=public_origin + AGENT_ASSERTION_PATH,
         relays=_relays(environ, relay_urls),
         command_principal=_command_principal(environ),
-        grant_ttl_seconds=_positive_int(environ, "BUZZ_AGENT_GRANT_TTL_SECONDS", DEFAULT_AGENT_GRANT_TTL_SECONDS),
+        grant_ttl_seconds=_agent_grant_ttl(environ),
         max_agents_per_user=_positive_int(environ, "BUZZ_MAX_AGENTS_PER_USER", DEFAULT_MAX_AGENTS_PER_USER),
     )
 
@@ -250,6 +251,16 @@ def _command_audiences(environ: Mapping[str, str], relay_urls: list[str]) -> lis
             "be in that relay's command_audiences for BUZZ_NIP_FI_ISSUER."
         )
     return entries
+
+
+def _agent_grant_ttl(environ: Mapping[str, str]) -> int:
+    ttl = _positive_int(environ, "BUZZ_AGENT_GRANT_TTL_SECONDS", DEFAULT_AGENT_GRANT_TTL_SECONDS)
+    if ttl > MAX_AGENT_GRANT_TTL_SECONDS:
+        raise AdapterConfigError(
+            f"BUZZ_AGENT_GRANT_TTL_SECONDS must be at most {MAX_AGENT_GRANT_TTL_SECONDS} (30 days), "
+            f"got {ttl} — refusing to start."
+        )
+    return ttl
 
 
 def _command_principal(environ: Mapping[str, str]) -> str:

@@ -19,6 +19,7 @@ from nip_fa.agent_grants import (
     TOKEN_EXCHANGE_GRANT_TYPE,
     grant_hash,
     grant_response,
+    is_grant_token,
     new_grant_token,
     parse_agent_grant_form,
     parse_agent_revoke_form,
@@ -34,6 +35,7 @@ from nip_fa.agents import (
 )
 from nip_fa.assertions import SigningKey
 from nip_fa.config import RelayEndpoint
+from nip_fa.identities import IdentityStoreUnavailable
 from nip_fa.owner_attestation import (
     NO_SUPPORTED_CLAUSES,
     condition_clauses,
@@ -98,7 +100,7 @@ class TestOwnerAttestation:
 
     @pytest.mark.parametrize("conditions", [
         "kind=1&", "&kind=1", "kind=1&&kind=2", "kind=01", "kind=65536", "kind= 1", "Kind=1",
-        "created_at<4294967296", "created_at=1", "expires=1",
+        "created_at<4294967296", "created_at=1", "expires=1", "kind=" + "1" * 5000,
     ])
     def test_malformed_conditions(self, conditions):
         assert condition_clauses(conditions) is None
@@ -196,6 +198,9 @@ class TestAgentRevokeForm:
 
 
 class TestGrantTokens:
+    def test_issued_tokens_have_the_grant_shape(self):
+        assert all(is_grant_token(new_grant_token()) for _ in range(50))
+
     def test_tokens_are_random_and_only_their_hash_is_stored(self):
         first, second = new_grant_token(), new_grant_token()
         assert first != second
@@ -536,9 +541,10 @@ class TestLaunchpadAgentStore:
                 await operation
 
     @pytest.mark.asyncio
-    async def test_an_unreachable_pool_is_unavailable(self):
+    @pytest.mark.parametrize("error", [OSError("no route"), IdentityStoreUnavailable()])
+    async def test_an_unreachable_pool_is_unavailable(self, error):
         async def pool_factory():
-            raise OSError("no route")
+            raise error
 
         with pytest.raises(AgentStoreUnavailable):
             await LaunchpadAgentStore(pool_factory).grant("cc" * 32)

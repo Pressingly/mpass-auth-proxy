@@ -22,7 +22,7 @@ NO_SUPPORTED_CLAUSES: frozenset[str] = frozenset()
 
 _KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
-_CLAUSE_PATTERN = re.compile(r"(?P<name>kind=|created_at<|created_at>)(?P<value>0|[1-9][0-9]*)")
+_CLAUSE_PATTERN = re.compile(r"(?P<name>kind=|created_at<|created_at>)(?P<value>0|[1-9][0-9]{0,9})")
 _CLAUSE_MAXIMUMS = {"kind=": 65535, "created_at<": 4_294_967_295, "created_at>": 4_294_967_295}
 
 

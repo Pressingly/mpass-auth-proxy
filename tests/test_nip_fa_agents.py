@@ -8,7 +8,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 import main as m
 from nip_fa.agent_grants import AGENT_GRANT_TOKEN_TYPE, SESSION_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE, grant_hash
-from nip_fa.agent_routes import AGENT_GRANT_RATE_LIMIT
+from nip_fa.agent_routes import AGENT_GRANT_RATE_LIMIT, AGENT_REVOKE_RATE_LIMIT
 from nip_fa.agents import AgentStoreUnavailable, Enrollment, Revocation, StoredGrant
 from nip_fa.identities import IdentityStoreUnavailable, StoredIdentity
 from nip_fa.relay_commands import DisconnectReport
@@ -407,6 +407,11 @@ class TestAgentGrant:
         assert _denial(_request_grant(body)) == (400, {"error": "invalid_grant"})
         assert agent_store.enrollments == []
 
+    def test_an_oversized_condition_is_invalid_grant(self, redis_store, clock, agent_store):
+        tag = json.dumps(["auth", _owner_pubkey(), "kind=" + "1" * 5000, "ab" * 64], separators=(",", ":"))
+        body = _grant_body(_signed_in(redis_store, clock), owner_attestation=tag)
+        assert _denial(_request_grant(body)) == (400, {"error": "invalid_grant"})
+
     def test_owner_key_cannot_be_its_own_agent(self, redis_store, clock, agent_store):
         owner = _owner_pubkey()
         session_token = _signed_in(redis_store, clock)
@@ -548,9 +553,20 @@ class TestAgentAssertion:
 
     def test_only_the_grants_agent_key(self, redis_store, clock, agent_store):
         _, grant = _enrolled(redis_store, clock)
-        body = _assertion_body(nostr_pubkey=_owner_pubkey())
-        response = _request_assertion(grant, body, proof=_proof(body, _agents().assertion_url))
+        body = _assertion_body(nostr_pubkey=_pubkey(OTHER_SECRET))
+        response = _request_assertion(grant, body, proof=_proof(body, _agents().assertion_url, secret=OTHER_SECRET))
         assert _denial(response) == (400, {"error": "invalid_request"})
+
+    def test_proof_must_be_signed_by_the_named_key(self, redis_store, clock, agent_store):
+        _, grant = _enrolled(redis_store, clock)
+        body = _assertion_body(nostr_pubkey=_pubkey(OTHER_SECRET))
+        response = _request_assertion(grant, body, proof=_proof(body, _agents().assertion_url))
+        assert _denial(response) == (403, {"error": "invalid_proof"})
+
+    @pytest.mark.parametrize("token", ["short", "x" * 44, "a" * 42 + "=", "a" * 42 + "."])
+    def test_a_token_not_shaped_like_a_grant_skips_the_store(self, redis_store, clock, agent_store, token):
+        agent_store.failure = AgentStoreUnavailable()
+        assert _denial(_request_assertion(token)) == (401, {"error": "invalid_grant"})
 
     def test_unknown_relay(self, redis_store, clock, agent_store):
         _, grant = _enrolled(redis_store, clock)
@@ -650,6 +666,12 @@ class TestAgentRevoke:
     def test_form_rules(self, redis_store, clock, agent_store, disconnector, body, expected):
         session_token = _signed_in(redis_store, clock)
         assert _request_revoke(session_token, body).status_code == expected
+
+    def test_rate_limited_per_session(self, redis_store, clock, agent_store, disconnector):
+        session_token = _signed_in(redis_store, clock)
+        for _ in range(AGENT_REVOKE_RATE_LIMIT):
+            assert _request_revoke(session_token).status_code == 404
+        assert _denial(_request_revoke(session_token)) == (429, {"error": "rate_limited"})
 
     def test_content_encoding_is_refused(self, redis_store, clock, agent_store, disconnector):
         session_token = _signed_in(redis_store, clock)

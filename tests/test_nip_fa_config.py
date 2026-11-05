@@ -203,6 +203,11 @@ class TestAgentConfig:
         with pytest.raises(AdapterConfigError, match=f"{name} must be a positive integer"):
             AdapterConfig.from_env({**_AGENTS, name: value})
 
+    def test_grant_ttl_is_bounded(self):
+        with pytest.raises(AdapterConfigError, match="BUZZ_AGENT_GRANT_TTL_SECONDS must be at most"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "2592001"})
+        assert AdapterConfig.from_env({**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "2592000"}).agents
+
     def test_agent_number_overrides(self):
         env = {**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "86400", "BUZZ_MAX_AGENTS_PER_USER": "2"}
         agents = AdapterConfig.from_env(env).agents

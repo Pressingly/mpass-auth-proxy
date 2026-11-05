@@ -92,8 +92,9 @@ class DisconnectReport:
 class RelayDisconnector:
     """Disconnects a key on every configured relay. `deny_seconds` should
     outlast every assertion already issued for the key, so it is the
-    assertion TTL; the relay refuses an `until` beyond its own
-    `maximum_assertion_age`, which must be at least that TTL."""
+    assertion TTL. The relay refuses an `until` past its own
+    `now + skew + maximum_assertion_age`, so those must exceed the TTL by the
+    clock drift between the two hosts."""
 
     def __init__(
         self,

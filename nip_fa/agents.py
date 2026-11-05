@@ -13,7 +13,7 @@ from typing import Protocol
 
 import asyncpg
 
-from .identities import DATABASE_ERRORS
+from .identities import DATABASE_ERRORS, IdentityStoreUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class LaunchpadAgentStore:
             pool = await self._pool_factory()
             async with pool.acquire() as conn:
                 return await operation(conn)
-        except DATABASE_ERRORS as exc:
+        except (*DATABASE_ERRORS, IdentityStoreUnavailable) as exc:
             logger.error("nip-fa: agent store unavailable: %s", type(exc).__name__)
             raise AgentStoreUnavailable() from exc
 

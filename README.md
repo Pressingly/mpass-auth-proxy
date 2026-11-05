@@ -138,8 +138,8 @@ never needs the settings below to start.
   extend it, and enrolling again replaces it.
 - Agent assertions have `typ` `nip-fi-agent+jwt`, `sub` the owner's mPass ID
   and `nostr_owner_pubkey` the owner's key, with `exp` capped by the grant.
-  They stop the moment the agent or its owner (`buzz_identities.revoked_at`) is
-  revoked.
+  They stop the moment the agent is revoked, or its owner's
+  `buzz_identities.revoked_at` is set.
 - NIP-98 proofs on the grant and assertion routes are single-use (event ids are
   remembered in Redis for 66 seconds).
 - Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
@@ -147,6 +147,18 @@ never needs the settings below to start.
   `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If
   any relay does not confirm, the revocation stands but the route answers `503`
   so the client retries, and a repeated revoke sends the disconnect again.
+
+**Do not turn `BUZZ_AGENTS_ENABLED` on before owner revocation ships.** A grant
+is not tied to the owner's adapter session, and nothing in this service sets
+`buzz_identities.revoked_at` yet: an owner whose mPass access ends (Cognito
+`invalid_grant`, corporate-ID gate) loses their sessions at the next hourly
+revalidation, but their agents keep getting assertions until the grant expires
+(up to `BUZZ_AGENT_GRANT_TTL_SECONDS`). Owner revocation must set that column
+and disconnect the owner's agents before the flag is on anywhere.
+
+`/nip-fa/v1/nip-fi/agent-assertion` looks a well-formed grant up in the
+launchpad database before any per-grant limit applies, on the pool email capture
+shares. Put a per-client rate limit on that path at the edge.
 
 It needs `BUZZ_RELAY_INTERNAL_URLS` (one per `BUZZ_RELAY_URLS` entry, same
 order) and `BUZZ_COMMAND_PRINCIPAL`, and optionally
@@ -158,10 +170,11 @@ issuer policy then also needs:
 | `command_audiences` | `https://` + the relay URL's authority, or that relay's `BUZZ_RELAY_COMMAND_AUDIENCES` entry |
 | `authorized_principals` | `BUZZ_COMMAND_PRINCIPAL` |
 | `maximum_command_age_seconds` | 1 to 60 (commands are sent as soon as they are signed) |
+| `maximum_assertion_age_seconds` and `skew_seconds` | `maximum_assertion_age_seconds` + `skew_seconds` above `BUZZ_ASSERTION_TTL_SECONDS` by at least the clock drift between this service and the relay. A disconnect's `until` is `now + BUZZ_ASSERTION_TTL_SECONDS` by this service's clock, and the relay refuses one past its own `now + skew + maximum_assertion_age`, so with no margin every revoke answers `503` |
 | token class | the dedicated NIP-FI class above, which admits `nip-fi-agent+jwt` too |
 
-Requests are limited to 10 grants per adapter session and 30 assertions per
-grant per 60 seconds.
+Requests are limited to 10 grants and 10 revocations per adapter session and 30
+assertions per grant, per 60 seconds.
 
 **Deploy order:** `buzz_identities` and its grants come from launchpad-api's
 `sql/schema.sql`. Apply that schema (`python -m src.migrate`) before enabling

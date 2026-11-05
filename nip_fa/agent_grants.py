@@ -29,6 +29,7 @@ GRANT_FIELDS = frozenset({*_FIXED_GRANT_FIELDS, "subject_token", "agent_pubkey",
 REVOKE_FIELDS = frozenset({"agent_pubkey"})
 
 _PUBKEY_PATTERN = re.compile(r"[0-9a-f]{64}")
+_GRANT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,12 @@ def parse_agent_revoke_form(raw: bytes) -> str | None:
 
 def new_grant_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def is_grant_token(value: str) -> bool:
+    """Shaped like a token new_grant_token issues, so anything else is
+    refused without a database lookup."""
+    return bool(_GRANT_TOKEN_PATTERN.fullmatch(value))
 
 
 def grant_hash(grant_token: str) -> str:
