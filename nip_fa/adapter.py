@@ -226,7 +226,7 @@ def _revocation_parts(
     if config.revocation is None:
         return None, None
     deny_seconds = config.assertion_ttl_seconds
-    revocation = OwnerRevocation(store, subjects, disconnector, deny_seconds)
+    revocation = OwnerRevocation(store, subjects, disconnector, deny_seconds, clock)
     return (
         AdminRoutes(config.revocation.admin_token, revocation),
         DenyRepusher(store, disconnector, deny_seconds, clock),
@@ -254,6 +254,7 @@ class NipFaAdapter:
             config.identity_master_secret,
             config.identity_salt,
             identity_store or LaunchpadIdentityStore(gateway.launchpad_pool),
+            self.sessions.subject_revoked if subjects is not None else None,
         )
         self.assertion_rate_limiter = AssertionRateLimiter(
             gateway.redis, ASSERTION_RATE_LIMIT, ASSERTION_RATE_WINDOW_SECONDS

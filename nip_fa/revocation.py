@@ -12,6 +12,7 @@ import asyncio
 import enum
 import hashlib
 import logging
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -25,7 +26,7 @@ from .relay_commands import RelayDisconnector
 logger = logging.getLogger(__name__)
 
 REVOKE_IDENTITY_SQL = (
-    "UPDATE buzz_identities SET revoked_at = now() WHERE sub = $1 AND revoked_at IS NULL "
+    "UPDATE buzz_identities SET revoked_at = clock_timestamp() WHERE sub = $1 AND revoked_at IS NULL "
     "RETURNING pubkey_hex, revoked_at"
 )
 IDENTITY_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1"
@@ -37,6 +38,7 @@ RECENT_REVOCATIONS_SQL = (
     "WHERE revoked_at > now() - make_interval(secs => $1)"
 )
 DENY_REPUSH_INTERVAL_SECONDS = 30
+DENY_REPUSH_CONCURRENCY = 8
 
 
 class RevocationStoreUnavailable(Exception):
@@ -78,7 +80,9 @@ class RevocationStore(Protocol):
 
 
 def _epoch(row) -> int:
-    return int(row["revoked_at"].timestamp())
+    """Rounded up, so a deny anchored on it never ends before an assertion
+    issued in the same second the revocation was written."""
+    return math.ceil(row["revoked_at"].timestamp())
 
 
 class LaunchpadRevocationStore:
@@ -162,10 +166,16 @@ def deny_until(revoked_at: int, deny_seconds: int) -> int:
 
 
 class OwnerRevocation:
-    """Revokes an mPass ID: database first (durable and authoritative), then
-    the session tombstone, then a disconnect of the owner key on every relay.
+    """Revokes an mPass ID: the session tombstone first, so a key bind racing
+    the revocation re-checks it and fails closed; then the database (durable
+    and authoritative); then a disconnect of the owner key on every relay.
     Each step is idempotent, so a caller retries the whole call on any
-    incomplete outcome."""
+    incomplete outcome.
+
+    The deny lasts until the later of the stored revocation time and this
+    service's clock after the commit, plus the assertion TTL: every assertion
+    issued from a read that still saw the user as active read its clock before
+    that commit, so it expires by then."""
 
     def __init__(
         self,
@@ -173,23 +183,26 @@ class OwnerRevocation:
         subjects: RevokedSubjects,
         disconnector: RelayDisconnector,
         deny_seconds: int,
+        clock,
     ):
         self.store = store
         self.subjects = subjects
         self.disconnector = disconnector
         self._deny_seconds = deny_seconds
+        self._clock = clock
 
     async def revoke(self, sub: str) -> RevocationResult:
         try:
-            stored = await self.store.revoke(sub)
             await self.subjects.mark(sub)
+            stored = await self.store.revoke(sub)
         except (RevocationStoreUnavailable, SubjectMarksUnavailable) as exc:
             logger.error("nip-fa: owner revoke unavailable mpass_id=%s error=%s", sub, type(exc).__name__)
             return RevocationResult(RevocationOutcome.UNAVAILABLE)
         if stored is None:
             logger.warning("nip-fa: owner revoked mpass_id=%s outcome=not_bound; sessions ended", sub)
             return RevocationResult(RevocationOutcome.NOT_BOUND)
-        report = await self.disconnector.disconnect(stored.pubkey, deny_until(stored.revoked_at, self._deny_seconds))
+        anchor = max(stored.revoked_at, int(self._clock()))
+        report = await self.disconnector.disconnect(stored.pubkey, deny_until(anchor, self._deny_seconds))
         logger.warning(
             "nip-fa: owner revoked mpass_id=%s pubkey=%s newly=%s disconnect_complete=%s",
             sub, stored.pubkey, stored.newly_revoked, report.complete,
@@ -204,8 +217,10 @@ class DenyRepusher:
     last deny window, every DENY_REPUSH_INTERVAL_SECONDS. A relay keeps its
     deny set in memory only and exposes no restart signal, so a periodic
     re-push bounds the window a restarted relay could readmit a revoked key
-    with a still-valid assertion to one interval. Each re-push keeps the
-    original `until`, and the relay never shortens an active deny."""
+    with a still-valid assertion to one interval plus one tick. A re-push is
+    anchored on the stored revocation time, which can end a little before the
+    deny the revoking call sent; the relay keeps the later of the two while it
+    holds both, and the re-push only matters once a restart dropped them."""
 
     def __init__(
         self,
@@ -229,8 +244,13 @@ class DenyRepusher:
             return 0
         now = int(self._clock())
         live = [item for item in revocations if deny_until(item.revoked_at, self._deny_seconds) > now]
-        for item in live:
-            await self._disconnector.disconnect(item.pubkey, deny_until(item.revoked_at, self._deny_seconds))
+        slots = asyncio.Semaphore(DENY_REPUSH_CONCURRENCY)
+
+        async def push(item: RecentRevocation) -> None:
+            async with slots:
+                await self._disconnector.disconnect(item.pubkey, deny_until(item.revoked_at, self._deny_seconds))
+
+        await asyncio.gather(*(push(item) for item in live))
         return len(live)
 
     async def run_forever(self) -> None:

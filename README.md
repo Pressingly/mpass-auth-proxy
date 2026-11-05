@@ -194,20 +194,27 @@ curl -sS -X POST http://mpass-auth-proxy:8000/internal/nip-fa/v1/identity/revoke
   a Redis tombstone kept for `BUZZ_ADAPTER_SESSION_TTL_SECONDS`.
 - Ends every agent grant the user authorized: a grant is usable only while its
   owner is not revoked, and no new agent can enroll under a revoked owner.
-- Disconnects the user's key on every relay, until `revoked_at` plus
-  `BUZZ_ASSERTION_TTL_SECONDS`. One disconnect covers the user's agents too: the
+- Disconnects the user's key on every relay, until the later of `revoked_at`
+  (rounded up) and this service's clock after the commit, plus
+  `BUZZ_ASSERTION_TTL_SECONDS`: every assertion issued before the revocation
+  took effect has expired by then. One disconnect covers the user's agents too: the
   relay closes sessions whose recorded owner is the target, and denies an agent
   assertion whose owner it has denied (NIP-FI "Agent keys").
 - Answers `{"revoked": true, "nostr_pubkey"}`, or `{"revoked": false}` for a
-  user who never bound a key (their sessions still end). `503 unavailable` means
+  user who never bound a key. Their sessions still end and no key is issued to
+  them while the tombstone lasts (`BUZZ_ADAPTER_SESSION_TTL_SECONDS`), but
+  nothing is recorded in the database, so offboarding must also end their mPass
+  access, as it does today. `503 unavailable` means
   retry: every step is idempotent, and a repeat sends the disconnect again.
 
 A relay keeps its deny set in memory and forgets it on restart, without telling
 the issuer. So while revocation is on, every replica re-sends, every 30
 seconds, the disconnect for each owner or agent key revoked within the last
-`BUZZ_ASSERTION_TTL_SECONDS`, with its original `until`. A restarted relay can
-therefore readmit a revoked key, with an assertion issued before the revocation,
-for at most 30 seconds.
+`BUZZ_ASSERTION_TTL_SECONDS`, anchored on the stored revocation time (up to 8
+keys at a time). A restarted relay can therefore readmit a revoked key, with an
+assertion issued before the revocation, for at most 30 seconds plus the time
+one re-push takes; that grows by the relay timeout (5 seconds per batch of 8
+keys) while some relay is unreachable.
 
 Each relay's issuer policy needs:
 
@@ -216,7 +223,7 @@ Each relay's issuer policy needs:
 | `command_audiences` | `https://` + the relay URL's authority, or that relay's `BUZZ_RELAY_COMMAND_AUDIENCES` entry |
 | `authorized_principals` | `BUZZ_COMMAND_PRINCIPAL` |
 | `maximum_command_age_seconds` | 1 to 60 (commands are sent as soon as they are signed) |
-| `maximum_assertion_age_seconds` and `skew_seconds` | `maximum_assertion_age_seconds` + `skew_seconds` above `BUZZ_ASSERTION_TTL_SECONDS` by at least the clock drift between this service and the relay. A disconnect's `until` is `now + BUZZ_ASSERTION_TTL_SECONDS` by this service's clock, and the relay refuses one past its own `now + skew + maximum_assertion_age`, so with no margin every revoke answers `503` |
+| `maximum_assertion_age_seconds` and `skew_seconds` | `maximum_assertion_age_seconds` + `skew_seconds` above `BUZZ_ASSERTION_TTL_SECONDS` by at least the clock drift between this service and the relay plus one second (owner denies are rounded up to the second). A disconnect's `until` is `now + BUZZ_ASSERTION_TTL_SECONDS` by this service's clock, and the relay refuses one past its own `now + skew + maximum_assertion_age`, so with no margin every revoke answers `503` |
 | token class | the dedicated NIP-FI class above, which admits `nip-fi-agent+jwt` too |
 
 **Deploy order:** `buzz_identities` and its grants come from launchpad-api's

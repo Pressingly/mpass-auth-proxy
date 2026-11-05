@@ -98,10 +98,21 @@ def issuance_status(derived_pubkey_hex: str, stored: StoredIdentity | None) -> K
 
 
 class IdentityKeyService:
-    def __init__(self, master_secret: bytes, salt: bytes, store: IdentityStore):
+    """`subject_revoked`, when given, is re-checked after a bind: an owner
+    revocation that found no key to revoke has already ended the user's
+    sessions, so a bind racing it must not hand that user a key."""
+
+    def __init__(
+        self,
+        master_secret: bytes,
+        salt: bytes,
+        store: IdentityStore,
+        subject_revoked: Callable[[str], Awaitable[bool]] | None = None,
+    ):
         self._master_secret = master_secret
         self._salt = salt
         self._store = store
+        self._subject_revoked = subject_revoked
 
     def __repr__(self) -> str:
         return "IdentityKeyService(<redacted>)"
@@ -119,7 +130,20 @@ class IdentityKeyService:
         if status is not KeyIssuanceStatus.ISSUED:
             _log_refusal(identity.sub, status, stored)
             return KeyIssuance(status)
-        return KeyIssuance(status, keypair)
+        return await self._unless_subject_revoked(identity.sub, KeyIssuance(status, keypair))
+
+    async def _unless_subject_revoked(self, sub: str, issuance: KeyIssuance) -> KeyIssuance:
+        if self._subject_revoked is None:
+            return issuance
+        try:
+            revoked = await self._subject_revoked(sub)
+        except Exception as exc:  # noqa: BLE001  any tombstone read failure fails closed
+            logger.warning("nip-fa: identity key unavailable for mpass_id=%s error=%s", sub, type(exc).__name__)
+            return KeyIssuance(KeyIssuanceStatus.UNAVAILABLE)
+        if revoked:
+            logger.warning("nip-fa: identity key refused mpass_id=%s reason=subject_revoked", sub)
+            return KeyIssuance(KeyIssuanceStatus.REVOKED)
+        return issuance
 
     async def issue(self, identity: Identity) -> KeyIssuance:
         issuance = await self.bind(identity)

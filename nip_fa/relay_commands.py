@@ -123,8 +123,8 @@ class RelayDisconnector:
         self._http_client = http_client
 
     async def disconnect(self, target_pubkey: str, until: int | None = None) -> DisconnectReport:
-        """`until` defaults to now plus the deny window; a re-push passes the
-        original one, so a repeated disconnect never extends a deny."""
+        """`until` defaults to now plus the deny window. Owner revocation and
+        the re-push pass one anchored on the stored revocation time instead."""
         async with self._http_client() as client:
             results = await asyncio.gather(
                 *(self._disconnect_on(client, relay, target_pubkey, until) for relay in self._relays),

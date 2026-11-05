@@ -11,7 +11,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 import main as m
 from nip_fa import revocation as revocation_sql
 from nip_fa.admin_routes import INTERNAL_PREFIX
-from nip_fa.identities import IdentityStoreUnavailable
+from nip_fa.identities import IdentityStoreUnavailable, StoredIdentity
 from nip_fa.relay_commands import DisconnectReport, RelayDisconnector
 from nip_fa.revocation import (
     BoundIdentity,
@@ -86,6 +86,15 @@ class TestLaunchpadRevocationStore:
         assert await _store_over(connection).revoke("sub-1") == StoredRevocation(_OWNER, _NOW - 100, True)
         assert connection.statements == [(revocation_sql.REVOKE_IDENTITY_SQL, ("sub-1",))]
         assert "revoked_at IS NULL" in revocation_sql.REVOKE_IDENTITY_SQL
+
+    @pytest.mark.asyncio
+    async def test_revocation_time_rounds_up_and_uses_the_statement_clock(self):
+        fractional = datetime.fromtimestamp(_NOW + 0.2, UTC)
+        connection = _ScriptedConnection(
+            {revocation_sql.REVOKE_IDENTITY_SQL: {"pubkey_hex": _OWNER, "revoked_at": fractional}}
+        )
+        assert (await _store_over(connection).revoke("sub-1")).revoked_at == _NOW + 1
+        assert "clock_timestamp()" in revocation_sql.REVOKE_IDENTITY_SQL
 
     @pytest.mark.asyncio
     async def test_an_already_revoked_identity_keeps_its_first_revocation_time(self):
@@ -197,10 +206,13 @@ class _Disconnector:
         return DisconnectReport(failed_relays=self.failed)
 
 
-def _revocation(store, disconnector=None, redis=None):
+def _revocation(store, disconnector=None, redis=None, now=_NOW):
     shared = redis or _SubjectRedis()
     subjects = RevokedSubjects(lambda: shared, 60)
-    return OwnerRevocation(store, subjects, disconnector or _Disconnector(), deny_seconds=_TTL), subjects
+    revocation = OwnerRevocation(
+        store, subjects, disconnector or _Disconnector(), deny_seconds=_TTL, clock=lambda: float(now)
+    )
+    return revocation, subjects
 
 
 class TestOwnerRevocation:
@@ -216,11 +228,25 @@ class TestOwnerRevocation:
         assert disconnector.calls == [(_OWNER, _NOW + _TTL)]
 
     @pytest.mark.asyncio
-    async def test_a_repeat_keeps_the_first_deny_window(self):
+    async def test_the_deny_never_ends_before_the_service_clock_plus_ttl(self):
         disconnector = _Disconnector()
         revocation, _ = _revocation(_Store(StoredRevocation(_OWNER, _NOW - 1000, False)), disconnector)
         assert (await revocation.revoke("mpass-1")).outcome is RevocationOutcome.REVOKED
-        assert disconnector.calls == [(_OWNER, _NOW - 1000 + _TTL)]
+        assert disconnector.calls == [(_OWNER, _NOW + _TTL)]
+
+    @pytest.mark.asyncio
+    async def test_a_revocation_stored_ahead_of_the_service_clock_anchors_the_deny(self):
+        disconnector = _Disconnector()
+        revocation, _ = _revocation(_Store(StoredRevocation(_OWNER, _NOW + 1, True)), disconnector)
+        await revocation.revoke("mpass-1")
+        assert disconnector.calls == [(_OWNER, _NOW + 1 + _TTL)]
+
+    @pytest.mark.asyncio
+    async def test_the_tombstone_is_set_before_the_database_is_asked(self):
+        redis = _SubjectRedis()
+        revocation, subjects = _revocation(_Store(failure=RevocationStoreUnavailable()), redis=redis)
+        assert (await revocation.revoke("mpass-1")).outcome is RevocationOutcome.UNAVAILABLE
+        assert await subjects.is_revoked("mpass-1")
 
     @pytest.mark.asyncio
     async def test_an_unbound_user_still_has_sessions_ended(self):
@@ -262,6 +288,28 @@ class TestDenyRepusher:
         assert await repusher.push_once() == 2
 
         assert disconnector.calls == [(_OWNER, _NOW + 200), (_AGENT, _NOW + 1)]
+
+    @pytest.mark.asyncio
+    async def test_keys_are_pushed_concurrently(self):
+        in_flight, peak = 0, 0
+        release = asyncio.Event()
+
+        class _Slow(_Disconnector):
+            async def disconnect(self, target_pubkey, until=None):
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                if peak >= revocation_sql.DENY_REPUSH_CONCURRENCY:
+                    release.set()
+                await release.wait()
+                in_flight -= 1
+                return await super().disconnect(target_pubkey, until)
+
+        recent = [RecentRevocation(f"{index:064x}", _NOW) for index in range(20)]
+        repusher = DenyRepusher(_Store(recent=recent), _Slow(), _TTL, clock=lambda: float(_NOW))
+
+        assert await asyncio.wait_for(repusher.push_once(), timeout=5) == 20
+        assert peak == revocation_sql.DENY_REPUSH_CONCURRENCY
 
     @pytest.mark.asyncio
     async def test_store_outage_skips_the_tick(self):
@@ -449,6 +497,26 @@ class TestRevokeRoute:
         for record in caplog.records:
             assert _admin_token() not in record.getMessage()
             assert "guessed-token" not in record.getMessage()
+
+
+class TestKeyBindRacingARevocation:
+    def test_a_key_bound_after_the_tombstone_is_not_issued(self, redis_store, clock, admin):
+        session_token = _signed_in(redis_store, clock)
+        keys = m._buzz_adapter.identity_keys
+        real_store = keys._store
+
+        class _BindsDuringRevoke:
+            async def ensure_identity(self, sub, pubkey_hex, email):
+                redis_store.values[revocation_sql.subject_mark_key(sub)] = "1"
+                return StoredIdentity(pubkey_hex=pubkey_hex, revoked=False)
+
+        keys._store = _BindsDuringRevoke()
+        try:
+            response = client.get("/nip-fa/v1/identity/key", headers={"Authorization": f"Bearer {session_token}"})
+        finally:
+            keys._store = real_store
+        assert (response.status_code, response.json()) == (403, {"error": "authorization_denied"})
+        assert "secret_key" not in response.text
 
 
 class TestPubkeyRoute:
