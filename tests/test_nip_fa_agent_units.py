@@ -28,6 +28,7 @@ from nip_fa.agent_routes import grant_refusal_reason
 from nip_fa.agents import (
     AgentStoreUnavailable,
     Enrollment,
+    EnrollmentRaced,
     EnrollmentRequest,
     LaunchpadAgentStore,
     Revocation,
@@ -535,7 +536,7 @@ class TestLaunchpadAgentStore:
     @pytest.mark.asyncio
     async def test_a_concurrently_enrolled_agent_is_not_reported_revoked(self):
         connection = _ScriptedConnection({agent_sql.REVOKE_SQL: None, agent_sql.OWNED_AGENT_SQL: _row(revoked_at=None)})
-        with pytest.raises(AgentStoreUnavailable):
+        with pytest.raises(EnrollmentRaced):
             await _store(connection).revoke("owner-1", _AGENT)
 
     @pytest.mark.asyncio

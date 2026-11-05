@@ -190,6 +190,7 @@ class LaunchpadAgentStore:
             if owned is None:
                 return Revocation.NOT_FOUND
             if owned["revoked_at"] is None:
+                logger.warning("nip-fa: agent revoke raced an enrollment mpass_id=%s agent=%s", owner_sub, agent_pubkey)
                 raise EnrollmentRaced()
             return Revocation.ALREADY_REVOKED
 
