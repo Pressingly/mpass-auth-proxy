@@ -89,6 +89,18 @@ class DisconnectReport:
         return not self.failed_relays
 
 
+def _succeeded(relay: RelayEndpoint, target_pubkey: str, result: bool | BaseException) -> bool:
+    """A disconnect that raised (a bad URL, a signing error) fails that relay
+    only, so the caller still answers and logs an incomplete disconnect."""
+    if isinstance(result, BaseException):
+        logger.error(
+            "nip-fa: relay disconnect errored relay=%s pubkey=%s error=%s",
+            relay.relay_url, target_pubkey, type(result).__name__,
+        )
+        return False
+    return result
+
+
 class RelayDisconnector:
     """Disconnects a key on every configured relay. `deny_seconds` should
     outlast every assertion already issued for the key, so it is the
@@ -113,10 +125,15 @@ class RelayDisconnector:
     async def disconnect(self, target_pubkey: str) -> DisconnectReport:
         async with self._http_client() as client:
             results = await asyncio.gather(
-                *(self._disconnect_on(client, relay, target_pubkey) for relay in self._relays)
+                *(self._disconnect_on(client, relay, target_pubkey) for relay in self._relays),
+                return_exceptions=True,
             )
         return DisconnectReport(
-            failed_relays=tuple(relay.relay_url for relay, ok in zip(self._relays, results) if not ok)
+            failed_relays=tuple(
+                relay.relay_url
+                for relay, result in zip(self._relays, results)
+                if not _succeeded(relay, target_pubkey, result)
+            )
         )
 
     async def _disconnect_on(self, client: httpx.AsyncClient, relay: RelayEndpoint, target_pubkey: str) -> bool:

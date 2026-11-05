@@ -132,7 +132,9 @@ never needs the settings below to start.
   NIP-98 proof signed by the agent key. Only empty attestation conditions are
   accepted. An agent key belongs to its first owner for good, a revoked one
   never enrolls again, a user's own Buzz key can never be an agent, and each
-  user may hold `BUZZ_MAX_AGENTS_PER_USER` unrevoked agents (default 5).
+  user may hold `BUZZ_MAX_AGENTS_PER_USER` agents with a live grant (default
+  5). Expired grants do not count, because clients delete agents without
+  revoking them; re-enrolling an expired agent is counted again.
 - The grant is opaque; launchpad's `buzz_agents` stores only its SHA-256. It
   lasts `BUZZ_AGENT_GRANT_TTL_SECONDS` (default 691200, 8 days), use does not
   extend it, and enrolling again replaces it.

@@ -257,6 +257,7 @@ class AgentRoutes:
             owner_pubkey=owner_pubkey,
             agent_pubkey=form.agent_pubkey,
             grant_hash=grant_hash(token),
+            issued_at=now,
             expires_at=now + self._agents.grant_ttl_seconds,
             max_agents=self._agents.max_agents_per_user,
         )

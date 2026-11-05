@@ -83,6 +83,7 @@ class _FakeAgentStore:
         others = [
             agent for agent, row in self.rows.items()
             if row["owner_sub"] == request.owner_sub and not row["revoked"] and agent != request.agent_pubkey
+            and row["expires_at"] > request.issued_at
         ]
         if len(others) >= request.max_agents:
             return Enrollment.CAP_REACHED
@@ -427,6 +428,39 @@ class TestAgentGrant:
         agent_store.forced = outcome
         response = _request_grant(_grant_body(_signed_in(redis_store, clock)))
         assert _denial(response) == expected
+
+    def test_abandoned_enrollments_do_not_hold_a_slot(self, redis_store, clock, agent_store):
+        session_token = _signed_in(redis_store, clock)
+        cap = _agents().max_agents_per_user
+        abandoned = [bytes([0x30 + index]) * 32 for index in range(cap)]
+        for secret in abandoned:
+            assert self._enroll(session_token, secret).status_code == 200
+        assert _denial(self._enroll(session_token, bytes.fromhex("44" * 32))) == (429, {"error": "rate_limited"})
+
+        self._expire(agent_store, *(_pubkey(secret) for secret in abandoned))
+        assert self._enroll(session_token, bytes.fromhex("44" * 32)).status_code == 200
+
+    def test_re_enrolling_an_expired_agent_goes_through_the_cap(self, redis_store, clock, agent_store):
+        session_token = _signed_in(redis_store, clock)
+        assert self._enroll(session_token, _AGENT_SECRET).status_code == 200
+        self._expire(agent_store, _AGENT)
+        for index in range(_agents().max_agents_per_user):
+            assert self._enroll(session_token, bytes([0x50 + index]) * 32).status_code == 200
+        assert _denial(self._enroll(session_token, _AGENT_SECRET)) == (429, {"error": "rate_limited"})
+
+    @staticmethod
+    def _expire(agent_store, *agents: str):
+        for agent in agents:
+            agent_store.rows[agent]["expires_at"] = _T0 - 1
+
+    def _enroll(self, session_token: str, secret: bytes):
+        """Fresh rate-limit window per call, so only the agent cap can refuse."""
+        for key in [key for key in m.redis_client.values if key.startswith("nip_fa_agent_grant_rate:")]:
+            del m.redis_client.values[key]
+        agent = _pubkey(secret)
+        body = _grant_body(session_token, agent=agent)
+        clock_now = m._buzz_adapter.sessions.now()
+        return _request_grant(body, proof=_proof(body, _agents().grant_url, secret=secret, created_at=clock_now))
 
     def test_an_agent_of_another_owner_is_refused(self, redis_store, clock, agent_store):
         agent_store.rows[_AGENT] = {

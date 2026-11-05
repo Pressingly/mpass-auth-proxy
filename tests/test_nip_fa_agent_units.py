@@ -366,6 +366,30 @@ class TestRelayDisconnector:
         assert report.failed_relays == ("wss://a.example.com", "wss://b.example.com:8443")
 
     @pytest.mark.asyncio
+    async def test_an_error_before_the_request_fails_that_relay_only(self, caplog):
+        def broken_key():
+            raise RuntimeError("signing key unavailable")
+
+        issuer = CommandIssuer(issuer=_ISSUER.issuer, principal=_ISSUER.principal, signing_key=broken_key)
+
+        def client():
+            return httpx.AsyncClient(transport=httpx.MockTransport(_accepting([])))
+
+        disconnector = RelayDisconnector(_RELAYS, issuer, 300, lambda: float(_NOW), client)
+        with caplog.at_level("ERROR"):
+            report = await disconnector.disconnect(_TARGET)
+
+        assert report.failed_relays == ("wss://a.example.com", "wss://b.example.com:8443")
+        assert any("error=RuntimeError" in record.getMessage() for record in caplog.records)
+        assert all("signing key unavailable" not in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_internal_url_fails_that_relay_only(self):
+        relays = (RelayEndpoint("wss://a.example.com", "http://\x00", "https://a.example.com"), _RELAYS[1])
+        report = await _disconnector(_accepting([]), relays=relays).disconnect(_TARGET)
+        assert report.failed_relays == ("wss://a.example.com",)
+
+    @pytest.mark.asyncio
     async def test_never_logs_the_command(self, caplog):
         requests: list[httpx.Request] = []
         with caplog.at_level("DEBUG"):
@@ -447,7 +471,7 @@ _REVOKED = datetime(2026, 1, 1, tzinfo=UTC)
 _AGENT = "bb" * 32
 _ENROLL = EnrollmentRequest(
     owner_sub="owner-1", owner_pubkey=_OWNER_PUBKEY, agent_pubkey=_AGENT, grant_hash="cc" * 32,
-    expires_at=_NOW + 600, max_agents=2,
+    issued_at=_NOW, expires_at=_NOW + 600, max_agents=2,
 )
 
 
@@ -456,7 +480,7 @@ def _enroll_answers(**overrides) -> dict:
         agent_sql.LOCK_OWNER_SQL: _row(pubkey_hex=_OWNER_PUBKEY, revoked_at=None),
         agent_sql.IS_IDENTITY_KEY_SQL: False,
         agent_sql.EXISTING_AGENT_SQL: None,
-        agent_sql.OTHER_ACTIVE_AGENTS_SQL: 1,
+        agent_sql.OTHER_LIVE_AGENTS_SQL: 1,
         agent_sql.ENROLL_SQL: _AGENT,
     }
     answers.update(overrides)
@@ -475,7 +499,7 @@ class TestLaunchpadAgentStore:
             agent_sql.LOCK_OWNER_SQL,
             agent_sql.IS_IDENTITY_KEY_SQL,
             agent_sql.EXISTING_AGENT_SQL,
-            agent_sql.OTHER_ACTIVE_AGENTS_SQL,
+            agent_sql.OTHER_LIVE_AGENTS_SQL,
             agent_sql.ENROLL_SQL,
         ]
         assert "FOR NO KEY UPDATE" in agent_sql.LOCK_OWNER_SQL
@@ -491,11 +515,20 @@ class TestLaunchpadAgentStore:
         ({agent_sql.IS_IDENTITY_KEY_SQL: True}, Enrollment.AGENT_REFUSED),
         ({agent_sql.EXISTING_AGENT_SQL: _row(owner_sub="owner-2", revoked_at=None)}, Enrollment.AGENT_REFUSED),
         ({agent_sql.EXISTING_AGENT_SQL: _row(owner_sub="owner-1", revoked_at=_REVOKED)}, Enrollment.AGENT_REFUSED),
-        ({agent_sql.OTHER_ACTIVE_AGENTS_SQL: 2}, Enrollment.CAP_REACHED),
+        ({agent_sql.OTHER_LIVE_AGENTS_SQL: 2}, Enrollment.CAP_REACHED),
         ({agent_sql.ENROLL_SQL: None}, Enrollment.AGENT_REFUSED),
     ])
     async def test_refusals(self, answers, outcome):
         assert await _store(_ScriptedConnection(_enroll_answers() | answers)).enroll(_ENROLL) is outcome
+
+    @pytest.mark.asyncio
+    async def test_the_cap_counts_only_unexpired_grants(self):
+        connection = _ScriptedConnection(_enroll_answers())
+        await _store(connection).enroll(_ENROLL)
+        count_sql, count_args = connection.statements[3]
+        assert count_sql == agent_sql.OTHER_LIVE_AGENTS_SQL
+        assert "revoked_at IS NULL" in count_sql and "grant_expires_at > $3" in count_sql
+        assert count_args == ("owner-1", _AGENT, datetime.fromtimestamp(_NOW, UTC))
 
     @pytest.mark.asyncio
     async def test_re_enrolling_an_own_active_agent_is_not_capped_by_itself(self):
@@ -503,7 +536,7 @@ class TestLaunchpadAgentStore:
             _enroll_answers() | {agent_sql.EXISTING_AGENT_SQL: _row(owner_sub="owner-1", revoked_at=None)}
         )
         assert await _store(connection).enroll(_ENROLL) is Enrollment.ENROLLED
-        assert connection.statements[3][1] == ("owner-1", _AGENT)
+        assert connection.statements[3][1][:2] == ("owner-1", _AGENT)
 
     @pytest.mark.asyncio
     async def test_reads_a_grant(self):

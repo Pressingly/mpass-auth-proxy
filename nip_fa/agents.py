@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 LOCK_OWNER_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1 FOR NO KEY UPDATE"
 IS_IDENTITY_KEY_SQL = "SELECT EXISTS (SELECT 1 FROM buzz_identities WHERE pubkey_hex = $1)"
 EXISTING_AGENT_SQL = "SELECT owner_sub, revoked_at FROM buzz_agents WHERE agent_pubkey = $1"
-OTHER_ACTIVE_AGENTS_SQL = (
-    "SELECT count(*) FROM buzz_agents WHERE owner_sub = $1 AND revoked_at IS NULL AND agent_pubkey <> $2"
+OTHER_LIVE_AGENTS_SQL = (
+    "SELECT count(*) FROM buzz_agents "
+    "WHERE owner_sub = $1 AND revoked_at IS NULL AND agent_pubkey <> $2 AND grant_expires_at > $3"
 )
 ENROLL_SQL = (
     "INSERT INTO buzz_agents (agent_pubkey, owner_sub, grant_hash, grant_expires_at) "
@@ -73,6 +74,7 @@ class EnrollmentRequest:
     owner_pubkey: str
     agent_pubkey: str
     grant_hash: str
+    issued_at: int
     expires_at: int
     max_agents: int
 
@@ -137,6 +139,13 @@ def agent_refusal(existing_row, owner_sub: str) -> bool:
     )
 
 
+async def _other_live_agents(conn, request: EnrollmentRequest) -> int:
+    """Agents holding an unexpired grant. Clients delete agents without
+    revoking them, so an expired, unrevoked enrollment must not hold a slot."""
+    issued_at = datetime.fromtimestamp(request.issued_at, UTC)
+    return await conn.fetchval(OTHER_LIVE_AGENTS_SQL, request.owner_sub, request.agent_pubkey, issued_at)
+
+
 async def _enroll_locked(conn, request: EnrollmentRequest) -> Enrollment:
     owner = await conn.fetchrow(LOCK_OWNER_SQL, request.owner_sub)
     if owner_refusal(owner, request.owner_pubkey):
@@ -145,7 +154,7 @@ async def _enroll_locked(conn, request: EnrollmentRequest) -> Enrollment:
         return Enrollment.AGENT_REFUSED
     if agent_refusal(await conn.fetchrow(EXISTING_AGENT_SQL, request.agent_pubkey), request.owner_sub):
         return Enrollment.AGENT_REFUSED
-    if await conn.fetchval(OTHER_ACTIVE_AGENTS_SQL, request.owner_sub, request.agent_pubkey) >= request.max_agents:
+    if await _other_live_agents(conn, request) >= request.max_agents:
         return Enrollment.CAP_REACHED
     expires_at = datetime.fromtimestamp(request.expires_at, UTC)
     enrolled = await conn.fetchval(

@@ -449,3 +449,30 @@ class TestFlagOffCallback:
         assert status == "302"
         assert "login_error=expired_flow" in location
         assert "127.0.0.1" not in location
+
+
+_PROBE_AGENT_ROUTES = (
+    "import json, main\n"
+    "from fastapi.testclient import TestClient\n"
+    "client = TestClient(main.app)\n"
+    "routes = ['agent-grant', 'agent-assertion', 'agent-revoke']\n"
+    "answers = [client.post('/nip-fa/v1/nip-fi/' + route) for route in routes]\n"
+    "print(json.dumps({\n"
+    "    'agents': main._BUZZ_ADAPTER_CONFIG.agents is not None,\n"
+    "    'answers': [[response.status_code, response.json()] for response in answers],\n"
+    "}))\n"
+)
+
+
+class TestAgentsOffAtImport:
+    """A host that already runs the adapter, deployed with this image and no
+    agent settings: it must start, and the agent routes must refuse."""
+
+    def test_adapter_starts_with_agents_unset_and_refuses_agent_routes(self):
+        env = {**_ENABLED, "LAUNCHPAD_EMAIL_CAPTURE": "false"}
+        assert "BUZZ_AGENTS_ENABLED" not in env
+        result = _run_main(_PROBE_AGENT_ROUTES, **env)
+        assert result.returncode == 0, result.stderr
+        probe = json.loads(result.stdout.strip().splitlines()[-1])
+        assert probe["agents"] is False
+        assert probe["answers"] == [[403, {"error": "agent_unsupported"}]] * 3
