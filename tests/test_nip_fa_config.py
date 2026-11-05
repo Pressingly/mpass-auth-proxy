@@ -14,6 +14,7 @@ from nip_fa.config import (
     AdapterConfigError,
     AgentConfig,
     RelayEndpoint,
+    RevocationConfig,
 )
 
 _SECRET_HEX = "ab" * 32
@@ -102,12 +103,64 @@ class TestAdapterConfig:
             AdapterConfig.from_env({**_ENABLED, "BUZZ_ADAPTER_SESSION_TTL_SECONDS": ttl})
 
 
-_AGENTS = {
+_ADMIN_TOKEN = "admin-token-" + "x" * 32
+_REVOCATION = {
     **_ENABLED,
-    "BUZZ_AGENTS_ENABLED": "true",
+    "BUZZ_REVOCATION_ENABLED": "true",
+    "BUZZ_ADMIN_TOKEN": _ADMIN_TOKEN,
     "BUZZ_RELAY_INTERNAL_URLS": "http://buzz-relay:3000",
     "BUZZ_COMMAND_PRINCIPAL": "mpass-auth-proxy@auth.example.com",
 }
+_AGENTS = {**_REVOCATION, "BUZZ_AGENTS_ENABLED": "true"}
+
+
+class TestRevocationConfig:
+    def test_revocation_is_off_unless_its_flag_is_on(self):
+        assert AdapterConfig.from_env(_ENABLED).revocation is None
+
+    @pytest.mark.parametrize("flag", ["", "false", "0", "no"])
+    def test_revocation_settings_are_not_read_with_the_flag_off(self, flag):
+        env = {
+            **_ENABLED,
+            "BUZZ_REVOCATION_ENABLED": flag,
+            "BUZZ_ADMIN_TOKEN": "",
+            "BUZZ_RELAY_URLS": "wss://a.example.com,wss://a.example.com",
+            "BUZZ_RELAY_INTERNAL_URLS": "not a url",
+            "BUZZ_COMMAND_PRINCIPAL": "",
+        }
+        assert AdapterConfig.from_env(env).revocation is None
+
+    def test_revocation_flag_alone_does_not_enable_the_adapter(self):
+        assert AdapterConfig.from_env({"BUZZ_REVOCATION_ENABLED": "true"}) == AdapterConfig(enabled=False)
+
+    def test_enabled_config_carries_the_revocation_settings(self):
+        revocation = AdapterConfig.from_env(_REVOCATION).revocation
+        assert revocation == RevocationConfig(
+            admin_token=_ADMIN_TOKEN,
+            relays=(RelayEndpoint("wss://relay.example.com", "http://buzz-relay:3000", "https://relay.example.com"),),
+            command_principal="mpass-auth-proxy@auth.example.com",
+        )
+
+    def test_the_admin_token_is_never_in_the_repr(self):
+        config = AdapterConfig.from_env(_REVOCATION)
+        assert _ADMIN_TOKEN not in repr(config)
+        assert _ADMIN_TOKEN not in repr(config.revocation)
+
+    @pytest.mark.parametrize("token", ["", "s3cr3t", "x" * 31, "x" * 20 + " " + "x" * 20, "x" * 20 + "\x00" + "x" * 20])
+    def test_admin_token_must_be_long_and_plain(self, token):
+        with pytest.raises(AdapterConfigError, match="BUZZ_ADMIN_TOKEN") as raised:
+            AdapterConfig.from_env({**_REVOCATION, "BUZZ_ADMIN_TOKEN": token})
+        assert not token.strip() or token.strip() not in str(raised.value)
+
+    def test_agents_need_revocation(self):
+        env = {**_AGENTS, "BUZZ_REVOCATION_ENABLED": "false"}
+        with pytest.raises(AdapterConfigError, match="BUZZ_AGENTS_ENABLED is on but BUZZ_REVOCATION_ENABLED is off"):
+            AdapterConfig.from_env(env)
+
+    def test_revocation_without_agents(self):
+        config = AdapterConfig.from_env(_REVOCATION)
+        assert config.revocation is not None
+        assert config.agents is None
 
 
 class TestAgentConfig:
@@ -134,8 +187,6 @@ class TestAgentConfig:
         assert agents == AgentConfig(
             grant_url="https://auth.example.com/nip-fa/v1/nip-fi/agent-grant",
             assertion_url="https://auth.example.com/nip-fa/v1/nip-fi/agent-assertion",
-            relays=(RelayEndpoint("wss://relay.example.com", "http://buzz-relay:3000", "https://relay.example.com"),),
-            command_principal="mpass-auth-proxy@auth.example.com",
         )
         assert agents.grant_ttl_seconds == DEFAULT_AGENT_GRANT_TTL_SECONDS == 691_200
         assert agents.max_agents_per_user == DEFAULT_MAX_AGENTS_PER_USER == 5
@@ -146,14 +197,14 @@ class TestAgentConfig:
             "BUZZ_RELAY_URLS": "wss://a.example.com,wss://b.example.com:8443",
             "BUZZ_RELAY_INTERNAL_URLS": "http://relay-a:3000, https://relay-b.internal",
         }
-        assert AdapterConfig.from_env(env).agents.relays == (
+        assert AdapterConfig.from_env(env).revocation.relays == (
             RelayEndpoint("wss://a.example.com", "http://relay-a:3000", "https://a.example.com"),
             RelayEndpoint("wss://b.example.com:8443", "https://relay-b.internal", "https://b.example.com:8443"),
         )
 
     def test_command_audiences_override(self):
         env = {**_AGENTS, "BUZZ_RELAY_COMMAND_AUDIENCES": "https://relay-admin.example.com"}
-        assert AdapterConfig.from_env(env).agents.relays[0].command_audience == "https://relay-admin.example.com"
+        assert AdapterConfig.from_env(env).revocation.relays[0].command_audience == "https://relay-admin.example.com"
 
     @pytest.mark.parametrize("audiences", ["http://relay.example.com", "https://a.example.com,https://b.example.com"])
     def test_bad_command_audiences_refuse(self, audiences):
@@ -195,7 +246,7 @@ class TestAgentConfig:
     def test_command_principal_may_use_the_relay_maximum(self):
         principal = "p" * 2048
         config = AdapterConfig.from_env({**_AGENTS, "BUZZ_COMMAND_PRINCIPAL": principal})
-        assert config.agents.command_principal == principal
+        assert config.revocation.command_principal == principal
 
     @pytest.mark.parametrize("name", ["BUZZ_AGENT_GRANT_TTL_SECONDS", "BUZZ_MAX_AGENTS_PER_USER"])
     @pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5"])
@@ -476,3 +527,45 @@ class TestAgentsOffAtImport:
         probe = json.loads(result.stdout.strip().splitlines()[-1])
         assert probe["agents"] is False
         assert probe["answers"] == [[403, {"error": "agent_unsupported"}]] * 3
+
+
+_PROBE_INTERNAL_ROUTES = (
+    "import json, main\n"
+    "from fastapi.testclient import TestClient\n"
+    "client = TestClient(main.app)\n"
+    "revoke = client.post('/internal/nip-fa/v1/identity/revoke', json={'mpass_id': 'x'})\n"
+    "pubkey = client.get('/internal/nip-fa/v1/identity/pubkey', params={'mpass_id': 'x'})\n"
+    "grant = client.post('/nip-fa/v1/nip-fi/agent-grant')\n"
+    "print(json.dumps({\n"
+    "    'revocation': main._BUZZ_ADAPTER_CONFIG.revocation is not None,\n"
+    "    'statuses': [revoke.status_code, pubkey.status_code, grant.status_code],\n"
+    "}))\n"
+)
+
+
+class TestRevocationAtImport:
+    """Fresh imports, as a deployment starts this image."""
+
+    def _probe(self, **env) -> dict:
+        result = _run_main(_PROBE_INTERNAL_ROUTES, LAUNCHPAD_EMAIL_CAPTURE="false", **env)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_adapter_on_with_revocation_unset_mounts_no_internal_route(self):
+        assert "BUZZ_REVOCATION_ENABLED" not in _ENABLED
+        assert self._probe(**_ENABLED) == {"revocation": False, "statuses": [404, 404, 403]}
+
+    def test_revocation_on_mounts_the_internal_routes_behind_the_token(self):
+        assert self._probe(**_REVOCATION) == {"revocation": True, "statuses": [401, 401, 403]}
+
+    def test_agents_without_revocation_refuse_to_start(self):
+        env = {**_ENABLED, "BUZZ_AGENTS_ENABLED": "true", "LAUNCHPAD_EMAIL_CAPTURE": "false"}
+        result = _run_main("import main", **env)
+        assert result.returncode != 0
+        assert "BUZZ_AGENTS_ENABLED is on but BUZZ_REVOCATION_ENABLED is off" in result.stderr
+
+    def test_revocation_without_a_token_refuses_to_start(self):
+        env = {**_REVOCATION, "BUZZ_ADMIN_TOKEN": "", "LAUNCHPAD_EMAIL_CAPTURE": "false"}
+        result = _run_main("import main", **env)
+        assert result.returncode != 0
+        assert "BUZZ_ADMIN_TOKEN" in result.stderr

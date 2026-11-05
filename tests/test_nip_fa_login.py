@@ -77,6 +77,9 @@ class _RecordingRedis:
         self.values.pop(key, None)
         self.ttls.pop(key, None)
 
+    async def exists(self, key):
+        return int(key in self.values)
+
     def keys_with_prefix(self, prefix):
         return [key for key in self.values if key.startswith(prefix)]
 

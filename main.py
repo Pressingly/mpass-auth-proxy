@@ -1318,6 +1318,8 @@ _buzz_adapter: nip_fa.NipFaAdapter | None = (
 )
 if _buzz_adapter is not None:
     app.include_router(_buzz_adapter.router)
+    app.add_event_handler("startup", _buzz_adapter.start_background)
+    app.add_event_handler("shutdown", _buzz_adapter.stop_background)
 
 
 def _is_buzz_login(bridge_data: dict) -> bool:
