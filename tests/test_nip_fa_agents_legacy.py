@@ -151,8 +151,10 @@ class TestClientContract:
         assert claims["nostr_pubkey"] == reply["nostr_pubkey"] == _AGENT
         assert claims["nostr_owner_pubkey"] == _owner_pubkey()
         assert claims["iss"] == enrolled.json()["nip_fi_issuer"]
-        assert claims["exp"] == reply["expires_at"]
-        assert claims["iat"] <= _T0 + 5
+        assert claims["aud"] == "https://" + _relay()[len("wss://"):]
+        assert claims["exp"] == reply["expires_at"] > _T0
+        assert claims["iat"] <= _T0 + 5 and claims["iat"] <= claims["exp"]
+        assert len(reply["assertion"]) <= 8192 and all(reply["assertion"].split("."))
 
     def test_the_form_encoding_matches_the_client(self):
         encoded = rust_form_encode([("owner_attestation", '["auth","ab","",""]'), ("t", "a b~*")])

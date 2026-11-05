@@ -71,7 +71,6 @@ LEGACY_DIALECT = GrantDialect(
     }),
     issued_token_type=LEGACY_AGENT_GRANT_TOKEN_TYPE,
 )
-GRANT_FIELDS = SPEC_DIALECT.fields
 REVOKE_FIELDS = frozenset({"agent_pubkey"})
 
 _PUBKEY_PATTERN = re.compile(r"[0-9a-f]{64}")
