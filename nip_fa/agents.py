@@ -39,7 +39,7 @@ GRANT_SQL = (
     "WHERE a.grant_hash = $1"
 )
 REVOKE_SQL = (
-    "UPDATE buzz_agents SET revoked_at = now(), grant_hash = NULL, grant_expires_at = NULL "
+    "UPDATE buzz_agents SET revoked_at = clock_timestamp(), grant_hash = NULL, grant_expires_at = NULL "
     "WHERE agent_pubkey = $1 AND owner_sub = $2 AND revoked_at IS NULL "
     "RETURNING agent_pubkey"
 )

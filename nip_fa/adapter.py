@@ -1,6 +1,8 @@
 """NIP-FA browser login, code exchange, session check, identity key and relay
 assertion. The agent routes live in agent_routes.py."""
 
+import asyncio
+import contextlib
 import hashlib
 import logging
 import secrets
@@ -14,6 +16,7 @@ from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .admin_routes import AdminRoutes
 from .agent_routes import AgentRoutes
 from .agents import AgentStore, LaunchpadAgentStore
 from .assertions import (
@@ -50,6 +53,13 @@ from .responses import (
     request_too_large,
     session_expired,
     session_required,
+)
+from .revocation import (
+    DenyRepusher,
+    LaunchpadRevocationStore,
+    OwnerRevocation,
+    RevocationStore,
+    RevokedSubjects,
 )
 from .routes import (
     AGENT_ASSERTION_ROUTE,
@@ -196,14 +206,31 @@ def _single_bearer_token(headers: Headers) -> tuple[str | None, Response | None]
 
 
 def _relay_disconnector(config: AdapterConfig, gateway: PlatformGateway, clock) -> RelayDisconnector | None:
-    if config.agents is None:
+    if config.revocation is None:
         return None
     issuer = CommandIssuer(
         issuer=config.nip_fi_issuer,
-        principal=config.agents.command_principal,
+        principal=config.revocation.command_principal,
         signing_key=gateway.signing_key,
     )
-    return RelayDisconnector(config.agents.relays, issuer, config.assertion_ttl_seconds, clock)
+    return RelayDisconnector(config.revocation.relays, issuer, config.assertion_ttl_seconds, clock)
+
+
+def _revocation_parts(
+    config: AdapterConfig,
+    store: RevocationStore,
+    subjects: RevokedSubjects | None,
+    disconnector: RelayDisconnector | None,
+    clock,
+) -> tuple[AdminRoutes | None, DenyRepusher | None]:
+    if config.revocation is None:
+        return None, None
+    deny_seconds = config.assertion_ttl_seconds
+    revocation = OwnerRevocation(store, subjects, disconnector, deny_seconds, clock)
+    return (
+        AdminRoutes(config.revocation.admin_token, revocation),
+        DenyRepusher(store, disconnector, deny_seconds, clock),
+    )
 
 
 class NipFaAdapter:
@@ -215,15 +242,19 @@ class NipFaAdapter:
         identity_store: IdentityStore | None = None,
         agent_store: AgentStore | None = None,
         disconnector: RelayDisconnector | None = None,
+        revocation_store: RevocationStore | None = None,
     ):
         self._config = config
         self._gateway = gateway
         self.sealer = RecordSealer(config.identity_master_secret)
-        self.sessions = SessionService(SessionStore(gateway.redis, self.sealer), gateway, clock)
+        disconnector = disconnector or _relay_disconnector(config, gateway, clock)
+        subjects = RevokedSubjects(gateway.redis, config.session_ttl_seconds) if config.revocation else None
+        self.sessions = SessionService(SessionStore(gateway.redis, self.sealer), gateway, clock, subjects)
         self.identity_keys = IdentityKeyService(
             config.identity_master_secret,
             config.identity_salt,
             identity_store or LaunchpadIdentityStore(gateway.launchpad_pool),
+            self.sessions.subject_revoked if subjects is not None else None,
         )
         self.assertion_rate_limiter = AssertionRateLimiter(
             gateway.redis, ASSERTION_RATE_LIMIT, ASSERTION_RATE_WINDOW_SECONDS
@@ -234,13 +265,37 @@ class NipFaAdapter:
             authenticate=self.authenticate,
             identity_keys=self.identity_keys,
             store=agent_store or LaunchpadAgentStore(gateway.launchpad_pool),
-            disconnector=disconnector or _relay_disconnector(config, gateway, clock),
+            disconnector=disconnector,
             redis_factory=gateway.redis,
             signing_key=gateway.signing_key,
         )
+        self.admin, self.repusher = _revocation_parts(
+            config, revocation_store or LaunchpadRevocationStore(gateway.launchpad_pool), subjects, disconnector, clock
+        )
+        self._background: asyncio.Task | None = None
         self.router = self._build_router()
 
     def _build_router(self) -> APIRouter:
+        router = APIRouter()
+        router.include_router(self._public_router())
+        if self.admin is not None:
+            router.include_router(self.admin.router)
+        return router
+
+    def start_background(self) -> None:
+        """Starts the relay deny re-push when owner revocation is on."""
+        if self.repusher is not None and self._background is None:
+            self._background = asyncio.get_running_loop().create_task(self.repusher.run_forever())
+
+    async def stop_background(self) -> None:
+        if self._background is None:
+            return
+        self._background.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._background
+        self._background = None
+
+    def _public_router(self) -> APIRouter:
         router = APIRouter(prefix=ROUTE_PREFIX)
         router.add_api_route("/v1/login/start", self.start_login, methods=["GET"])
         router.add_api_route("/v1/login/exchange", self.exchange_code, methods=["POST"])
@@ -331,6 +386,9 @@ class NipFaAdapter:
             logger.error("nip-fa: login code record failed to unseal; code burned")
             return invalid_request()
         identity = Identity(**record["identity"])
+        if await self.sessions.subject_revoked(identity.sub):
+            logger.warning("nip-fa: exchange refused for revoked mpass_id=%s; code burned", identity.sub)
+            return invalid_request()
         if not challenge_matches(exchange.handoff_secret, record["handoff_challenge"]):
             logger.warning("nip-fa: handoff secret mismatch for mpass_id=%s; code burned", identity.sub)
             return invalid_request()

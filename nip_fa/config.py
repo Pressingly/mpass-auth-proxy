@@ -16,6 +16,7 @@ DEFAULT_AGENT_GRANT_TTL_SECONDS = 691_200
 DEFAULT_MAX_AGENTS_PER_USER = 5
 MAX_AGENT_GRANT_TTL_SECONDS = 2_592_000
 MAX_COMMAND_PRINCIPAL_BYTES = 2048
+MIN_ADMIN_TOKEN_CHARS = 32
 _DEFAULT_MPASS_PROXY_ISSUER_URL = "http://mpass-auth-proxy:8000"
 
 _TRUTHY = {"1", "true", "yes"}
@@ -40,15 +41,24 @@ class RelayEndpoint:
 
 
 @dataclass(frozen=True)
+class RevocationConfig:
+    """Owner revocation and relay disconnects, on only with
+    BUZZ_REVOCATION_ENABLED. It mounts the internal, admin-token routes and
+    holds the relay command settings agent revocation also uses."""
+
+    admin_token: str = field(repr=False)
+    relays: tuple[RelayEndpoint, ...]
+    command_principal: str
+
+
+@dataclass(frozen=True)
 class AgentConfig:
-    """NIP-FA agent keys, on only with BUZZ_AGENTS_ENABLED. Without it the
-    agent routes answer `403 agent_unsupported`, so turning the adapter on
-    never requires the agent settings."""
+    """NIP-FA agent keys, on only with BUZZ_AGENTS_ENABLED, which needs
+    BUZZ_REVOCATION_ENABLED: an agent must stop when its owner is revoked.
+    Without it the agent routes answer `403 agent_unsupported`."""
 
     grant_url: str
     assertion_url: str
-    relays: tuple[RelayEndpoint, ...]
-    command_principal: str
     grant_ttl_seconds: int = DEFAULT_AGENT_GRANT_TTL_SECONDS
     max_agents_per_user: int = DEFAULT_MAX_AGENTS_PER_USER
 
@@ -63,6 +73,7 @@ class AdapterConfig:
     relay_urls: frozenset[str] = frozenset()
     assertion_ttl_seconds: int = DEFAULT_ASSERTION_TTL_SECONDS
     assertions_url: str = ""
+    revocation: RevocationConfig | None = None
     agents: AgentConfig | None = None
 
     @classmethod
@@ -72,6 +83,7 @@ class AdapterConfig:
         _require_launchpad_db(environ)
         public_origin = _public_origin(environ)
         relay_urls = _relay_urls(environ)
+        revocation = _revocation_config(environ, relay_urls)
         return cls(
             enabled=True,
             session_ttl_seconds=_session_ttl(environ),
@@ -81,18 +93,45 @@ class AdapterConfig:
             relay_urls=frozenset(relay_urls),
             assertion_ttl_seconds=_assertion_ttl(environ),
             assertions_url=public_origin + ASSERTIONS_PATH,
-            agents=_agent_config(environ, public_origin, relay_urls),
+            revocation=revocation,
+            agents=_agent_config(environ, public_origin, revocation),
         )
 
 
-def _agent_config(environ: Mapping[str, str], public_origin: str, relay_urls: list[str]) -> AgentConfig | None:
+def _revocation_config(environ: Mapping[str, str], relay_urls: list[str]) -> RevocationConfig | None:
+    if not _flag_on(environ.get("BUZZ_REVOCATION_ENABLED", "")):
+        return None
+    return RevocationConfig(
+        admin_token=_admin_token(environ),
+        relays=_relays(environ, relay_urls),
+        command_principal=_command_principal(environ),
+    )
+
+
+def _admin_token(environ: Mapping[str, str]) -> str:
+    raw = environ.get("BUZZ_ADMIN_TOKEN", "").strip()
+    if len(raw) < MIN_ADMIN_TOKEN_CHARS or _UNSAFE_URL_CHARACTERS.search(raw):
+        raise AdapterConfigError(
+            f"BUZZ_REVOCATION_ENABLED is on but BUZZ_ADMIN_TOKEN is shorter than {MIN_ADMIN_TOKEN_CHARS} "
+            "characters or contains whitespace or control characters — refusing to start. Generate one "
+            "with `openssl rand -hex 32`. The value is not shown here."
+        )
+    return raw
+
+
+def _agent_config(
+    environ: Mapping[str, str], public_origin: str, revocation: RevocationConfig | None
+) -> AgentConfig | None:
     if not _flag_on(environ.get("BUZZ_AGENTS_ENABLED", "")):
         return None
+    if revocation is None:
+        raise AdapterConfigError(
+            "BUZZ_AGENTS_ENABLED is on but BUZZ_REVOCATION_ENABLED is off — refusing to start. Agent "
+            "grants must end when their owner is revoked, so turn owner revocation on with them."
+        )
     return AgentConfig(
         grant_url=public_origin + AGENT_GRANT_PATH,
         assertion_url=public_origin + AGENT_ASSERTION_PATH,
-        relays=_relays(environ, relay_urls),
-        command_principal=_command_principal(environ),
         grant_ttl_seconds=_agent_grant_ttl(environ),
         max_agents_per_user=_positive_int(environ, "BUZZ_MAX_AGENTS_PER_USER", DEFAULT_MAX_AGENTS_PER_USER),
     )
@@ -194,7 +233,7 @@ def _comma_list(environ: Mapping[str, str], name: str) -> list[str]:
 def _relays(environ: Mapping[str, str], relay_urls: list[str]) -> tuple[RelayEndpoint, ...]:
     if len(set(relay_urls)) != len(relay_urls):
         raise AdapterConfigError(
-            "BUZZ_AGENTS_ENABLED is on and BUZZ_RELAY_URLS lists a relay twice — refusing to start. "
+            "BUZZ_REVOCATION_ENABLED is on and BUZZ_RELAY_URLS lists a relay twice — refusing to start. "
             "BUZZ_RELAY_INTERNAL_URLS pairs with it by position."
         )
     internal_urls = _internal_urls(environ, len(relay_urls))
@@ -226,10 +265,10 @@ def _internal_urls(environ: Mapping[str, str], relay_count: int) -> list[str]:
     entries = _comma_list(environ, "BUZZ_RELAY_INTERNAL_URLS")
     if len(entries) != relay_count:
         raise AdapterConfigError(
-            f"BUZZ_AGENTS_ENABLED is on, so BUZZ_RELAY_INTERNAL_URLS must list one internal URL per "
+            f"BUZZ_REVOCATION_ENABLED is on, so BUZZ_RELAY_INTERNAL_URLS must list one internal URL per "
             f"BUZZ_RELAY_URLS entry, in the same order ({relay_count} expected, got {len(entries)}) "
             "— refusing to start. The adapter sends NIP-FI admin disconnects there when an agent "
-            "is revoked."
+            "or an owner is revoked."
         )
     rejected = [entry for entry in entries if not is_internal_http_origin(entry)]
     if rejected:
@@ -267,11 +306,11 @@ def _command_principal(environ: Mapping[str, str]) -> str:
     raw = environ.get("BUZZ_COMMAND_PRINCIPAL", "").strip()
     if not raw or _UNSAFE_URL_CHARACTERS.search(raw) or len(raw.encode("utf-8")) > MAX_COMMAND_PRINCIPAL_BYTES:
         raise AdapterConfigError(
-            "BUZZ_AGENTS_ENABLED is on but BUZZ_COMMAND_PRINCIPAL is empty, longer than "
+            "BUZZ_REVOCATION_ENABLED is on but BUZZ_COMMAND_PRINCIPAL is empty, longer than "
             f"{MAX_COMMAND_PRINCIPAL_BYTES} bytes, or contains whitespace or control characters "
             "— refusing to start. Set it to the principal listed in each "
             "relay's authorized_principals for BUZZ_NIP_FI_ISSUER; it is the `sub` of the "
-            "disconnect commands sent when an agent is revoked."
+            "disconnect commands sent when an owner or an agent is revoked."
         )
     return raw
 

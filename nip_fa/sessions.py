@@ -141,10 +141,11 @@ class SessionService:
     corporate-id gate re-run. A refusal ends the session; an outage leaves it
     in place for the caller to decide how to answer."""
 
-    def __init__(self, store: SessionStore, idp: IdentityProvider, clock):
+    def __init__(self, store: SessionStore, idp: IdentityProvider, clock, revoked_subjects=None):
         self._store = store
         self._idp = idp
         self._clock = clock
+        self._revoked_subjects = revoked_subjects
 
     def now(self) -> int:
         return int(self._clock())
@@ -161,6 +162,9 @@ class SessionService:
         await self._store.put(session_token, session, now)
         return session_token, session
 
+    async def subject_revoked(self, sub: str) -> bool:
+        return self._revoked_subjects is not None and await self._revoked_subjects.is_revoked(sub)
+
     async def lookup(self, session_token: str) -> SessionLookup:
         """`record_key` is the token's Redis key, for keying per-session state
         without holding the token itself."""
@@ -171,6 +175,10 @@ class SessionService:
         session = await self._store.load(session_token)
         if session is None:
             return SessionLookup(LookupStatus.MISSING)
+        if await self.subject_revoked(session.identity.sub):
+            await self._store.delete(session_token)
+            logger.warning("nip-fa: session ended for revoked mpass_id=%s", session.identity.sub)
+            return SessionLookup(LookupStatus.ENDED)
         now = self.now()
         if session.expired_at(now):
             await self._store.delete(session_token)
