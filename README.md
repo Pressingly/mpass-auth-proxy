@@ -151,6 +151,20 @@ and owner revocation off, because an agent must stop when its owner is revoked.
   and `nostr_owner_pubkey` the owner's key, with `exp` capped by the grant.
   They stop the moment the agent is revoked, or its owner's
   `buzz_identities.revoked_at` is set.
+- The current buzz-app desktop (block/buzz-app 9c94152) still enrolls in its
+  older Builderlab form, and `BUZZ_AGENTS_ACCEPT_LEGACY_CLIENT` (on by default)
+  accepts it on the grant route as an alias of the spec form:
+  `subject_token_type` `urn:builderlab:params:oauth:token-type:bb-session`,
+  `requested_token_type` `urn:builderlab:params:oauth:token-type:nip-fi-agent-grant`
+  (echoed back as `issued_token_type`), a seventh field `runtime=local`, and the
+  NIP-98 proof in `Nostr-Agent-Proof` instead of `Nostr-Authorization`. A
+  request takes one form whole: both proof headers, or the legacy header with
+  any spec field (or the reverse), is `400 invalid_request`. Everything after
+  parsing is the same code: proof verification, single use, owner attestation,
+  cap, rate limit and revocation. The client's assertion request is already the
+  spec form. Turn the flag off, and later delete the dialect, once buzz-app's
+  `src-tauri/src/federated_identity/agent/mod.rs` sends the `urn:nostr:` token
+  types and `Nostr-Authorization`, and our desktop build has picked that up.
 - NIP-98 proofs on the grant and assertion routes are single-use (event ids are
   remembered in Redis for 95 seconds, which covers clock drift between replicas).
 - Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same

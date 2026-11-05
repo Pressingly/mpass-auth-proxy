@@ -14,9 +14,12 @@ from starlette.responses import Response
 
 from .agent_grants import (
     FORM_CONTENT_TYPE,
+    LEGACY_DIALECT,
     MAX_AGENT_GRANT_BODY_BYTES,
     MAX_AGENT_REVOKE_BODY_BYTES,
+    SPEC_DIALECT,
     AgentGrantRequest,
+    GrantDialect,
     grant_hash,
     grant_response,
     is_grant_token,
@@ -97,8 +100,14 @@ def _grant_header_violation(headers: Headers) -> bool:
     )
 
 
-async def _read_proven_body(request: Request, limit: int) -> _ProvenBody | Response:
-    proof = _single_header(request.headers, "nostr-authorization")
+def _carries_both_proof_headers(headers: Headers) -> bool:
+    return SPEC_DIALECT.proof_header in headers and LEGACY_DIALECT.proof_header in headers
+
+
+async def _read_proven_body(
+    request: Request, limit: int, proof_header: str = SPEC_DIALECT.proof_header
+) -> _ProvenBody | Response:
+    proof = _single_header(request.headers, proof_header)
     if proof is None or "content-encoding" in request.headers:
         return invalid_request()
     try:
@@ -183,10 +192,13 @@ class AgentRoutes:
             return agent_unsupported()
         if _grant_header_violation(request.headers):
             return invalid_request()
-        body = await _read_proven_body(request, MAX_AGENT_GRANT_BODY_BYTES)
+        dialect = self._grant_dialect(request.headers)
+        if dialect is None:
+            return invalid_request()
+        body = await _read_proven_body(request, MAX_AGENT_GRANT_BODY_BYTES, dialect.proof_header)
         if isinstance(body, Response):
             return body
-        form = parse_agent_grant_form(body.raw)
+        form = parse_agent_grant_form(body.raw, dialect)
         if form is None:
             return invalid_request()
         session_or_denial = await self._owner_session(form.subject_token)
@@ -196,7 +208,21 @@ class AgentRoutes:
         denial = await self._proof_denial(identity, body, form.agent_pubkey, self._agents.grant_url, now)
         if denial is not None:
             return denial
-        return await self._enroll(identity, form, now)
+        return await self._enroll(identity, form, now, dialect)
+
+    def _grant_dialect(self, headers: Headers) -> GrantDialect | None:
+        """The dialect the proof header names. A request carrying both proof
+        headers, or the legacy one while legacy clients are off, is refused,
+        so no request can mix the two forms."""
+        if _carries_both_proof_headers(headers):
+            logger.warning("nip-fa: agent grant refused reason=both_proof_headers")
+            return None
+        if LEGACY_DIALECT.proof_header not in headers:
+            return SPEC_DIALECT
+        if not self._agents.accept_legacy_client:
+            logger.warning("nip-fa: agent grant refused reason=legacy_client_disabled")
+            return None
+        return LEGACY_DIALECT
 
     async def _owner_session(self, subject_token: str) -> tuple[Identity, int] | Response:
         lookup = await self._sessions.lookup(subject_token)
@@ -238,7 +264,7 @@ class AgentRoutes:
         logger.warning("nip-fa: agent request refused actor=%s reason=proof_replayed", actor)
         return invalid_request()
 
-    async def _enroll(self, identity: Identity, form: AgentGrantRequest, now: int) -> Response:
+    async def _enroll(self, identity: Identity, form: AgentGrantRequest, now: int, dialect: GrantDialect) -> Response:
         issuance = await self.identity_keys.bind(identity)
         if issuance.status is KeyIssuanceStatus.UNAVAILABLE:
             return issuance_unavailable()
@@ -271,9 +297,17 @@ class AgentRoutes:
                 identity.sub, form.agent_pubkey, enrollment.value,
             )
             return _ENROLLMENT_REFUSALS[enrollment]()
-        logger.info("nip-fa: agent grant issued mpass_id=%s agent=%s", identity.sub, form.agent_pubkey)
+        logger.info(
+            "nip-fa: agent grant issued mpass_id=%s agent=%s dialect=%s", identity.sub, form.agent_pubkey, dialect.name
+        )
         return adapter_json(
-            grant_response(token, self._agents.grant_ttl_seconds, owner_pubkey, self._config.nip_fi_issuer)
+            grant_response(
+                token,
+                self._agents.grant_ttl_seconds,
+                owner_pubkey,
+                self._config.nip_fi_issuer,
+                dialect.issued_token_type,
+            )
         )
 
     async def issue_assertion(self, request: Request) -> Response:
@@ -284,6 +318,8 @@ class AgentRoutes:
         token, denial = _grant_bearer(request.headers)
         if denial is not None:
             return denial
+        if LEGACY_DIALECT.proof_header in request.headers:
+            return invalid_request()
         body = await _read_proven_body(request, MAX_ASSERTION_BODY_BYTES)
         if isinstance(body, Response):
             return body
