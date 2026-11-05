@@ -23,7 +23,7 @@ _BIND_SQL = (
     "ON CONFLICT (sub) DO NOTHING"
 )
 _READ_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1"
-_DATABASE_ERRORS = (
+DATABASE_ERRORS = (
     asyncpg.PostgresError,
     asyncpg.InterfaceError,
     asyncpg.InternalClientError,
@@ -59,7 +59,7 @@ class LaunchpadIdentityStore:
             async with pool.acquire() as conn:
                 await _bind(conn, sub, pubkey_hex, email)
                 row = await conn.fetchrow(_READ_SQL, sub)
-        except _DATABASE_ERRORS as exc:
+        except DATABASE_ERRORS as exc:
             logger.error("nip-fa: identity store unavailable: %s", type(exc).__name__)
             raise IdentityStoreUnavailable() from exc
         if row is None:

@@ -28,6 +28,9 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/nip-fa/v1/session` | Buzz NIP-FA session check (Bearer adapter session), revalidated against Cognito at most hourly |
 | `GET`  | `/nip-fa/v1/identity/key` | Our extension to NIP-FA (Bearer adapter session): returns the platform-held Nostr key `{nostr_pubkey, secret_key}` for the session's mPass ID, the same key on every device |
 | `POST` | `/nip-fa/v1/identity/assertions` | Buzz NIP-FA relay assertion (Bearer adapter session + `Nostr-Authorization` NIP-98 proof): returns a short-lived NIP-FI assertion `{assertion, nostr_pubkey, expires_at}` for an allowlisted relay |
+| `POST` | `/nip-fa/v1/nip-fi/agent-grant` | Buzz NIP-FA agent grant (RFC 8693 form with the owner's session as `subject_token`, a NIP-OA `owner_attestation`, and a NIP-98 proof by the agent key): enrolls the agent and returns an opaque grant (only when `BUZZ_AGENTS_ENABLED`) |
+| `POST` | `/nip-fa/v1/nip-fi/agent-assertion` | Buzz NIP-FA agent assertion (Bearer agent grant + NIP-98 proof by the agent key): returns a `nip-fi-agent+jwt` carrying `nostr_owner_pubkey` |
+| `POST` | `/nip-fa/v1/nip-fi/agent-revoke` | Buzz NIP-FA agent revocation (Bearer owner session, form `agent_pubkey`): revokes the agent for good and disconnects it on every relay |
 | `GET`  | `/.well-known/jwks.json` | Public signing key, served when `LAUNCHPAD_EMAIL_CAPTURE` or `BUZZ_ADAPTER_ENABLED` is on (404 otherwise) |
 
 ### Traefik routing — cross-repo invariant
@@ -117,10 +120,54 @@ rate_limited` with `Retry-After`). The claims are `iss`, `sub` (the mPass ID),
 `aud`, `iat`, `exp`, `nostr_pubkey` and, when the email local part meets the
 relay's username rules, `nostr_public_profile` `{display_name, username}`.
 
+### Buzz agent keys
+
+`BUZZ_AGENTS_ENABLED` (off by default, read only with the adapter on) turns on
+the NIP-FA "Agent keys" routes, following `docs/nips/NIP-FA.md` in block/buzz
+at b14899f. With it off they answer `403 agent_unsupported`, so the adapter
+never needs the settings below to start.
+
+- An owner enrolls an agent key with their adapter session (as `subject_token`,
+  never a header), a NIP-OA `auth` tag signed by their platform-held key, and a
+  NIP-98 proof signed by the agent key. Only empty attestation conditions are
+  accepted. An agent key belongs to its first owner for good, a revoked one
+  never enrolls again, a user's own Buzz key can never be an agent, and each
+  user may hold `BUZZ_MAX_AGENTS_PER_USER` unrevoked agents (default 5).
+- The grant is opaque; launchpad's `buzz_agents` stores only its SHA-256. It
+  lasts `BUZZ_AGENT_GRANT_TTL_SECONDS` (default 691200, 8 days), use does not
+  extend it, and enrolling again replaces it.
+- Agent assertions have `typ` `nip-fi-agent+jwt`, `sub` the owner's mPass ID
+  and `nostr_owner_pubkey` the owner's key, with `exp` capped by the grant.
+  They stop the moment the agent or its owner (`buzz_identities.revoked_at`) is
+  revoked.
+- NIP-98 proofs on the grant and assertion routes are single-use (event ids are
+  remembered in Redis for 66 seconds).
+- Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
+  key and `kid`) and sends it to every relay's internal URL. The deny lasts
+  `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If
+  any relay does not confirm, the revocation stands but the route answers `503`
+  so the client retries, and a repeated revoke sends the disconnect again.
+
+It needs `BUZZ_RELAY_INTERNAL_URLS` (one per `BUZZ_RELAY_URLS` entry, same
+order) and `BUZZ_COMMAND_PRINCIPAL`, and optionally
+`BUZZ_RELAY_COMMAND_AUDIENCES`; `.env.example` describes each. Each relay's
+issuer policy then also needs:
+
+| Relay setting | Value |
+|---|---|
+| `command_audiences` | `https://` + the relay URL's authority, or that relay's `BUZZ_RELAY_COMMAND_AUDIENCES` entry |
+| `authorized_principals` | `BUZZ_COMMAND_PRINCIPAL` |
+| `maximum_command_age_seconds` | 1 to 60 (commands are sent as soon as they are signed) |
+| token class | the dedicated NIP-FI class above, which admits `nip-fi-agent+jwt` too |
+
+Requests are limited to 10 grants per adapter session and 30 assertions per
+grant per 60 seconds.
+
 **Deploy order:** `buzz_identities` and its grants come from launchpad-api's
 `sql/schema.sql`. Apply that schema (`python -m src.migrate`) before enabling
 the adapter here, or `/nip-fa/v1/identity/key` and `/nip-fa/v1/identity/assertions`
-answer `503 issuance_unavailable`.
+answer `503 issuance_unavailable`. The same goes for `buzz_agents` before
+`BUZZ_AGENTS_ENABLED`.
 
 Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
 the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),

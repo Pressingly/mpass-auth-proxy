@@ -5,13 +5,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .routes import ASSERTIONS_PATH
-from .urls import is_canonical_https_origin, is_canonical_relay_url
+from .routes import AGENT_ASSERTION_PATH, AGENT_GRANT_PATH, ASSERTIONS_PATH
+from .urls import is_canonical_https_origin, is_canonical_relay_url, is_internal_http_origin, relay_audience
 
 DEFAULT_SESSION_TTL_SECONDS = 2_592_000
 DEFAULT_ASSERTION_TTL_SECONDS = 300
 MIN_ASSERTION_TTL_SECONDS = 30
 MAX_ASSERTION_TTL_SECONDS = 3600
+DEFAULT_AGENT_GRANT_TTL_SECONDS = 691_200
+DEFAULT_MAX_AGENTS_PER_USER = 5
+MAX_COMMAND_PRINCIPAL_BYTES = 2048
 _DEFAULT_MPASS_PROXY_ISSUER_URL = "http://mpass-auth-proxy:8000"
 
 _TRUTHY = {"1", "true", "yes"}
@@ -25,6 +28,31 @@ class AdapterConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RelayEndpoint:
+    """A relay as the adapter addresses it for NIP-FI admin disconnects: its
+    public `relay_url`, the `internal_url` its disconnect API is reached on,
+    and the `command_audience` the relay accepts on command JWTs."""
+
+    relay_url: str
+    internal_url: str
+    command_audience: str
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """NIP-FA agent keys, on only with BUZZ_AGENTS_ENABLED. Without it the
+    agent routes answer `403 agent_unsupported`, so turning the adapter on
+    never requires the agent settings."""
+
+    grant_url: str
+    assertion_url: str
+    relays: tuple[RelayEndpoint, ...]
+    command_principal: str
+    grant_ttl_seconds: int = DEFAULT_AGENT_GRANT_TTL_SECONDS
+    max_agents_per_user: int = DEFAULT_MAX_AGENTS_PER_USER
+
+
+@dataclass(frozen=True)
 class AdapterConfig:
     enabled: bool
     session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS
@@ -34,22 +62,39 @@ class AdapterConfig:
     relay_urls: frozenset[str] = frozenset()
     assertion_ttl_seconds: int = DEFAULT_ASSERTION_TTL_SECONDS
     assertions_url: str = ""
+    agents: AgentConfig | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> "AdapterConfig":
         if not _flag_on(environ.get("BUZZ_ADAPTER_ENABLED", "")):
             return cls(enabled=False)
         _require_launchpad_db(environ)
+        public_origin = _public_origin(environ)
+        relay_urls = _relay_urls(environ)
         return cls(
             enabled=True,
             session_ttl_seconds=_session_ttl(environ),
             identity_master_secret=_master_secret(environ),
             identity_salt=_identity_salt(environ),
             nip_fi_issuer=_nip_fi_issuer(environ),
-            relay_urls=_relay_urls(environ),
+            relay_urls=frozenset(relay_urls),
             assertion_ttl_seconds=_assertion_ttl(environ),
-            assertions_url=_public_origin(environ) + ASSERTIONS_PATH,
+            assertions_url=public_origin + ASSERTIONS_PATH,
+            agents=_agent_config(environ, public_origin, relay_urls),
         )
+
+
+def _agent_config(environ: Mapping[str, str], public_origin: str, relay_urls: list[str]) -> AgentConfig | None:
+    if not _flag_on(environ.get("BUZZ_AGENTS_ENABLED", "")):
+        return None
+    return AgentConfig(
+        grant_url=public_origin + AGENT_GRANT_PATH,
+        assertion_url=public_origin + AGENT_ASSERTION_PATH,
+        relays=_relays(environ, relay_urls),
+        command_principal=_command_principal(environ),
+        grant_ttl_seconds=_positive_int(environ, "BUZZ_AGENT_GRANT_TTL_SECONDS", DEFAULT_AGENT_GRANT_TTL_SECONDS),
+        max_agents_per_user=_positive_int(environ, "BUZZ_MAX_AGENTS_PER_USER", DEFAULT_MAX_AGENTS_PER_USER),
+    )
 
 
 def _flag_on(raw: str) -> bool:
@@ -96,14 +141,15 @@ def _require_launchpad_db(environ: Mapping[str, str]) -> None:
 
 
 def _session_ttl(environ: Mapping[str, str]) -> int:
-    raw = environ.get("BUZZ_ADAPTER_SESSION_TTL_SECONDS", "").strip()
+    return _positive_int(environ, "BUZZ_ADAPTER_SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS)
+
+
+def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name, "").strip()
     if not raw:
-        return DEFAULT_SESSION_TTL_SECONDS
+        return default
     if not raw.isdigit() or int(raw) <= 0:
-        raise AdapterConfigError(
-            f"BUZZ_ADAPTER_SESSION_TTL_SECONDS must be a positive integer, got {raw!r}"
-            " — refusing to start."
-        )
+        raise AdapterConfigError(f"{name} must be a positive integer, got {raw!r} — refusing to start.")
     return int(raw)
 
 
@@ -139,9 +185,28 @@ def _is_issuer_url(raw: str) -> bool:
     return bool(parts.netloc) and "@" not in parts.netloc and not ("?" in raw or "#" in raw)
 
 
-def _relay_urls(environ: Mapping[str, str]) -> frozenset[str]:
-    entries = [entry.strip() for entry in environ.get("BUZZ_RELAY_URLS", "").split(",")]
-    if entries == [""]:
+def _comma_list(environ: Mapping[str, str], name: str) -> list[str]:
+    entries = [entry.strip() for entry in environ.get(name, "").split(",")]
+    return [] if entries == [""] else entries
+
+
+def _relays(environ: Mapping[str, str], relay_urls: list[str]) -> tuple[RelayEndpoint, ...]:
+    if len(set(relay_urls)) != len(relay_urls):
+        raise AdapterConfigError(
+            "BUZZ_AGENTS_ENABLED is on and BUZZ_RELAY_URLS lists a relay twice — refusing to start. "
+            "BUZZ_RELAY_INTERNAL_URLS pairs with it by position."
+        )
+    internal_urls = _internal_urls(environ, len(relay_urls))
+    audiences = _command_audiences(environ, relay_urls)
+    return tuple(
+        RelayEndpoint(relay_url=relay_url, internal_url=internal_url, command_audience=audience)
+        for relay_url, internal_url, audience in zip(relay_urls, internal_urls, audiences)
+    )
+
+
+def _relay_urls(environ: Mapping[str, str]) -> list[str]:
+    entries = _comma_list(environ, "BUZZ_RELAY_URLS")
+    if not entries:
         raise AdapterConfigError(
             "BUZZ_ADAPTER_ENABLED is on but BUZZ_RELAY_URLS is empty — refusing to start. "
             "List the relay URLs this adapter issues assertions for, comma-separated."
@@ -153,7 +218,51 @@ def _relay_urls(environ: Mapping[str, str]) -> frozenset[str]:
             f"default port omitted, no port 80, no trailing slash, path, query or fragment); "
             f"refusing to start on {rejected!r}. They are compared exactly, never normalised."
         )
-    return frozenset(entries)
+    return entries
+
+
+def _internal_urls(environ: Mapping[str, str], relay_count: int) -> list[str]:
+    entries = _comma_list(environ, "BUZZ_RELAY_INTERNAL_URLS")
+    if len(entries) != relay_count:
+        raise AdapterConfigError(
+            f"BUZZ_AGENTS_ENABLED is on, so BUZZ_RELAY_INTERNAL_URLS must list one internal URL per "
+            f"BUZZ_RELAY_URLS entry, in the same order ({relay_count} expected, got {len(entries)}) "
+            "— refusing to start. The adapter sends NIP-FI admin disconnects there when an agent "
+            "is revoked."
+        )
+    rejected = [entry for entry in entries if not is_internal_http_origin(entry)]
+    if rejected:
+        raise AdapterConfigError(
+            f"BUZZ_RELAY_INTERNAL_URLS entries must be http(s)://host[:port] origins with no path, "
+            f"query, fragment, userinfo or trailing slash; refusing to start on {rejected!r}."
+        )
+    return entries
+
+
+def _command_audiences(environ: Mapping[str, str], relay_urls: list[str]) -> list[str]:
+    entries = _comma_list(environ, "BUZZ_RELAY_COMMAND_AUDIENCES")
+    if not entries:
+        return [relay_audience(relay_url) for relay_url in relay_urls]
+    if len(entries) != len(relay_urls) or not all(_is_issuer_url(entry) for entry in entries):
+        raise AdapterConfigError(
+            f"BUZZ_RELAY_COMMAND_AUDIENCES, when set, must list one https audience per "
+            f"BUZZ_RELAY_URLS entry, in the same order; refusing to start on {entries!r}. Each must "
+            "be in that relay's command_audiences for BUZZ_NIP_FI_ISSUER."
+        )
+    return entries
+
+
+def _command_principal(environ: Mapping[str, str]) -> str:
+    raw = environ.get("BUZZ_COMMAND_PRINCIPAL", "").strip()
+    if not raw or _UNSAFE_URL_CHARACTERS.search(raw) or len(raw.encode("utf-8")) > MAX_COMMAND_PRINCIPAL_BYTES:
+        raise AdapterConfigError(
+            "BUZZ_AGENTS_ENABLED is on but BUZZ_COMMAND_PRINCIPAL is empty, longer than "
+            f"{MAX_COMMAND_PRINCIPAL_BYTES} bytes, or contains whitespace or control characters "
+            "— refusing to start. Set it to the principal listed in each "
+            "relay's authorized_principals for BUZZ_NIP_FI_ISSUER; it is the `sub` of the "
+            "disconnect commands sent when an agent is revoked."
+        )
+    return raw
 
 
 def _assertion_ttl(environ: Mapping[str, str]) -> int:
