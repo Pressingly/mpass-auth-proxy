@@ -1,4 +1,5 @@
-"""NIP-FA browser login, code exchange, session check, identity key and relay assertion."""
+"""NIP-FA browser login, code exchange, session check, identity key and relay
+assertion. The agent routes live in agent_routes.py."""
 
 import hashlib
 import logging
@@ -13,6 +14,8 @@ from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .agent_routes import AgentRoutes
+from .agents import AgentStore, LaunchpadAgentStore
 from .assertions import (
     MAX_ASSERTION_BODY_BYTES,
     AssertionRateLimiter,
@@ -34,6 +37,7 @@ from .identities import (
     LaunchpadIdentityStore,
 )
 from .nip98 import ExpectedRequest, ProofFailure, verify_http_auth
+from .relay_commands import CommandIssuer, RelayDisconnector
 from .responses import (
     adapter_json,
     adapter_redirect,
@@ -47,7 +51,13 @@ from .responses import (
     session_expired,
     session_required,
 )
-from .routes import ASSERTIONS_ROUTE, ROUTE_PREFIX
+from .routes import (
+    AGENT_ASSERTION_ROUTE,
+    AGENT_GRANT_ROUTE,
+    AGENT_REVOKE_ROUTE,
+    ASSERTIONS_ROUTE,
+    ROUTE_PREFIX,
+)
 from .sealing import LOGIN_CODE_RECORD, RecordSealer
 from .sessions import (
     Identity,
@@ -185,6 +195,17 @@ def _single_bearer_token(headers: Headers) -> tuple[str | None, Response | None]
     return token, None
 
 
+def _relay_disconnector(config: AdapterConfig, gateway: PlatformGateway, clock) -> RelayDisconnector | None:
+    if config.agents is None:
+        return None
+    issuer = CommandIssuer(
+        issuer=config.nip_fi_issuer,
+        principal=config.agents.command_principal,
+        signing_key=gateway.signing_key,
+    )
+    return RelayDisconnector(config.agents.relays, issuer, config.assertion_ttl_seconds, clock)
+
+
 class NipFaAdapter:
     def __init__(
         self,
@@ -192,6 +213,8 @@ class NipFaAdapter:
         gateway: PlatformGateway,
         clock=time.time,
         identity_store: IdentityStore | None = None,
+        agent_store: AgentStore | None = None,
+        disconnector: RelayDisconnector | None = None,
     ):
         self._config = config
         self._gateway = gateway
@@ -205,6 +228,16 @@ class NipFaAdapter:
         self.assertion_rate_limiter = AssertionRateLimiter(
             gateway.redis, ASSERTION_RATE_LIMIT, ASSERTION_RATE_WINDOW_SECONDS
         )
+        self.agents = AgentRoutes(
+            config=config,
+            sessions=self.sessions,
+            authenticate=self.authenticate,
+            identity_keys=self.identity_keys,
+            store=agent_store or LaunchpadAgentStore(gateway.launchpad_pool),
+            disconnector=disconnector or _relay_disconnector(config, gateway, clock),
+            redis_factory=gateway.redis,
+            signing_key=gateway.signing_key,
+        )
         self.router = self._build_router()
 
     def _build_router(self) -> APIRouter:
@@ -214,6 +247,9 @@ class NipFaAdapter:
         router.add_api_route("/v1/session", self.check_session, methods=["GET"])
         router.add_api_route("/v1/identity/key", self.issue_identity_key, methods=["GET"])
         router.add_api_route(ASSERTIONS_ROUTE, self.issue_assertion, methods=["POST"])
+        router.add_api_route(AGENT_GRANT_ROUTE, self.agents.issue_grant, methods=["POST"])
+        router.add_api_route(AGENT_ASSERTION_ROUTE, self.agents.issue_assertion, methods=["POST"])
+        router.add_api_route(AGENT_REVOKE_ROUTE, self.agents.revoke, methods=["POST"])
         return router
 
     def owns(self, bridge_data: dict) -> bool:

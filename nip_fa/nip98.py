@@ -1,4 +1,4 @@
-"""NIP-98 HTTP Auth verification for the NIP-FA assertion route.
+"""NIP-98 HTTP Auth verification for the NIP-FA assertion and agent routes.
 
 The proof travels as `Nostr-Authorization: Nostr <base64(event JSON)>`. The
 base64 is the standard alphabet with padding (RFC 4648 section 4), as NIP-98
@@ -48,6 +48,7 @@ class ProofFailure(enum.Enum):
 @dataclass(frozen=True)
 class VerifiedProof:
     pubkey: str
+    event_id: str
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,7 @@ def verify_http_auth(header_value: str, expected: ExpectedRequest, now: int) -> 
         return ProofFailure.MALFORMED_HEADER
     if not is_well_formed_event(event):
         return ProofFailure.MALFORMED_EVENT
-    return _first_failure(event, expected, now) or VerifiedProof(event["pubkey"])
+    return _first_failure(event, expected, now) or VerifiedProof(event["pubkey"], event["id"])
 
 
 def decode_header(header_value: str) -> dict | None:

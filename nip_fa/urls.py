@@ -39,6 +39,16 @@ def is_canonical_https_origin(origin: str) -> bool:
     return _is_canonical_authority(origin[len(prefix):], 443, None)
 
 
+def is_internal_http_origin(origin: str) -> bool:
+    """`http://host[:port]` or `https://host[:port]`, canonical, for a relay's
+    in-cluster address. The port is always allowed because services listen on
+    non-default ports internally."""
+    for scheme, default_port in (("http://", 80), ("https://", 443)):
+        if origin.startswith(scheme):
+            return _is_canonical_authority(origin[len(scheme):], default_port, None)
+    return False
+
+
 def _is_canonical_authority(authority: str, default_port: int, refused_port: int | None) -> bool:
     match = _AUTHORITY_PATTERN.fullmatch(authority)
     if match is None:

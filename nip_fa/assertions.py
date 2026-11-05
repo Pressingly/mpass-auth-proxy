@@ -12,6 +12,7 @@ from .bodies import strict_json_loads
 from .urls import relay_audience
 
 ASSERTION_TYP = "nip-fi+jwt"
+AGENT_ASSERTION_TYP = "nip-fi-agent+jwt"
 ASSERTION_ALGORITHM = "RS256"
 ASSERTION_FIELDS = frozenset({"relay_url", "nostr_pubkey"})
 MAX_ASSERTION_BODY_BYTES = 4096
@@ -85,9 +86,32 @@ def assertion_claims(
     return claims
 
 
-def assertion_expiry(issued_at: int, ttl_seconds: int, session_expires_at: int) -> int:
-    """NIP-FA: never later than the adapter session's expiry."""
-    return min(issued_at + ttl_seconds, session_expires_at)
+def agent_assertion_claims(
+    issuer: str,
+    owner_sub: str,
+    relay_url: str,
+    agent_pubkey: str,
+    owner_pubkey: str,
+    issued_at: int,
+    expires_at: int,
+) -> dict:
+    """NIP-FI "Agent keys": `sub` stays the owner's mPass ID, and
+    `nostr_owner_pubkey` names the owner key the agent acts for."""
+    return {
+        "iss": issuer,
+        "sub": owner_sub,
+        "aud": relay_audience(relay_url),
+        "iat": issued_at,
+        "exp": expires_at,
+        "nostr_pubkey": agent_pubkey,
+        "nostr_owner_pubkey": owner_pubkey,
+    }
+
+
+def assertion_expiry(issued_at: int, ttl_seconds: int, credential_expires_at: int) -> int:
+    """NIP-FA: never later than the credential it is issued under, the adapter
+    session for a user and the agent grant for an agent."""
+    return min(issued_at + ttl_seconds, credential_expires_at)
 
 
 @dataclass(frozen=True)
@@ -99,12 +123,12 @@ class SigningKey:
         return f"SigningKey(kid={self.kid!r}, private_key=<redacted>)"
 
 
-def sign_assertion(claims: dict, signing_key: SigningKey) -> str:
+def sign_assertion(claims: dict, signing_key: SigningKey, typ: str = ASSERTION_TYP) -> str:
     return jwt.encode(
         claims,
         signing_key.private_key,
         algorithm=ASSERTION_ALGORITHM,
-        headers={"typ": ASSERTION_TYP, "kid": signing_key.kid},
+        headers={"typ": typ, "kid": signing_key.kid},
     )
 
 
@@ -122,18 +146,19 @@ _NO_EXPIRY = -1
 
 
 class AssertionRateLimiter:
-    """A fixed window per adapter session, counted in Redis under the session
-    record's key (a token hash), never the token itself."""
+    """A fixed window per credential (an adapter session or an agent grant),
+    counted in Redis under a hash of it, never the credential itself."""
 
     KEY_PREFIX = "nip_fa_assertion_rate:"
 
-    def __init__(self, redis_factory, limit: int, window_seconds: int):
+    def __init__(self, redis_factory, limit: int, window_seconds: int, key_prefix: str = KEY_PREFIX):
         self._redis_factory = redis_factory
         self._limit = limit
         self._window_seconds = window_seconds
+        self._key_prefix = key_prefix
 
-    async def check(self, session_record_key: str) -> RateDecision:
-        key = self.KEY_PREFIX + session_record_key
+    async def check(self, credential_key: str) -> RateDecision:
+        key = self._key_prefix + credential_key
         try:
             count, ttl = await self._count(key)
         except (RedisError, OSError) as exc:

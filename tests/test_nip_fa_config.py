@@ -6,10 +6,14 @@ import sys
 import pytest
 
 from nip_fa.config import (
+    DEFAULT_AGENT_GRANT_TTL_SECONDS,
     DEFAULT_ASSERTION_TTL_SECONDS,
+    DEFAULT_MAX_AGENTS_PER_USER,
     DEFAULT_SESSION_TTL_SECONDS,
     AdapterConfig,
     AdapterConfigError,
+    AgentConfig,
+    RelayEndpoint,
 )
 
 _SECRET_HEX = "ab" * 32
@@ -98,6 +102,118 @@ class TestAdapterConfig:
             AdapterConfig.from_env({**_ENABLED, "BUZZ_ADAPTER_SESSION_TTL_SECONDS": ttl})
 
 
+_AGENTS = {
+    **_ENABLED,
+    "BUZZ_AGENTS_ENABLED": "true",
+    "BUZZ_RELAY_INTERNAL_URLS": "http://buzz-relay:3000",
+    "BUZZ_COMMAND_PRINCIPAL": "mpass-auth-proxy@auth.example.com",
+}
+
+
+class TestAgentConfig:
+    def test_agents_are_off_unless_their_flag_is_on(self):
+        assert AdapterConfig.from_env(_ENABLED).agents is None
+
+    @pytest.mark.parametrize("flag", ["", "false", "0", "no"])
+    def test_agent_settings_are_not_read_with_the_flag_off(self, flag):
+        env = {
+            **_ENABLED,
+            "BUZZ_AGENTS_ENABLED": flag,
+            "BUZZ_RELAY_URLS": "wss://a.example.com,wss://a.example.com",
+            "BUZZ_RELAY_INTERNAL_URLS": "not a url",
+            "BUZZ_COMMAND_PRINCIPAL": "",
+            "BUZZ_MAX_AGENTS_PER_USER": "0",
+        }
+        assert AdapterConfig.from_env(env).agents is None
+
+    def test_agent_flag_alone_does_not_enable_the_adapter(self):
+        assert AdapterConfig.from_env({"BUZZ_AGENTS_ENABLED": "true"}) == AdapterConfig(enabled=False)
+
+    def test_enabled_config_carries_the_agent_settings(self):
+        agents = AdapterConfig.from_env(_AGENTS).agents
+        assert agents == AgentConfig(
+            grant_url="https://auth.example.com/nip-fa/v1/nip-fi/agent-grant",
+            assertion_url="https://auth.example.com/nip-fa/v1/nip-fi/agent-assertion",
+            relays=(RelayEndpoint("wss://relay.example.com", "http://buzz-relay:3000", "https://relay.example.com"),),
+            command_principal="mpass-auth-proxy@auth.example.com",
+        )
+        assert agents.grant_ttl_seconds == DEFAULT_AGENT_GRANT_TTL_SECONDS == 691_200
+        assert agents.max_agents_per_user == DEFAULT_MAX_AGENTS_PER_USER == 5
+
+    def test_internal_urls_pair_with_relays_by_position(self):
+        env = {
+            **_AGENTS,
+            "BUZZ_RELAY_URLS": "wss://a.example.com,wss://b.example.com:8443",
+            "BUZZ_RELAY_INTERNAL_URLS": "http://relay-a:3000, https://relay-b.internal",
+        }
+        assert AdapterConfig.from_env(env).agents.relays == (
+            RelayEndpoint("wss://a.example.com", "http://relay-a:3000", "https://a.example.com"),
+            RelayEndpoint("wss://b.example.com:8443", "https://relay-b.internal", "https://b.example.com:8443"),
+        )
+
+    def test_command_audiences_override(self):
+        env = {**_AGENTS, "BUZZ_RELAY_COMMAND_AUDIENCES": "https://relay-admin.example.com"}
+        assert AdapterConfig.from_env(env).agents.relays[0].command_audience == "https://relay-admin.example.com"
+
+    @pytest.mark.parametrize("audiences", ["http://relay.example.com", "https://a.example.com,https://b.example.com"])
+    def test_bad_command_audiences_refuse(self, audiences):
+        with pytest.raises(AdapterConfigError, match="BUZZ_RELAY_COMMAND_AUDIENCES"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_RELAY_COMMAND_AUDIENCES": audiences})
+
+    @pytest.mark.parametrize("internal", ["", "http://a:3000,http://b:3000"])
+    def test_internal_urls_must_match_the_relay_count(self, internal):
+        with pytest.raises(AdapterConfigError, match="one internal URL per BUZZ_RELAY_URLS entry"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_RELAY_INTERNAL_URLS": internal})
+
+    @pytest.mark.parametrize("internal", [
+        "http://buzz-relay:3000/",
+        "http://buzz-relay:3000/api",
+        "http://user@buzz-relay:3000",
+        "ftp://buzz-relay",
+        "http://Buzz-Relay:3000",
+        "http://buzz-relay:80",
+        "buzz-relay:3000",
+    ])
+    def test_non_canonical_internal_urls_refuse(self, internal):
+        with pytest.raises(AdapterConfigError, match="BUZZ_RELAY_INTERNAL_URLS entries must be"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_RELAY_INTERNAL_URLS": internal})
+
+    def test_a_relay_listed_twice_refuses(self):
+        env = {
+            **_AGENTS,
+            "BUZZ_RELAY_URLS": "wss://a.example.com,wss://a.example.com",
+            "BUZZ_RELAY_INTERNAL_URLS": "http://a:3000,http://b:3000",
+        }
+        with pytest.raises(AdapterConfigError, match="lists a relay twice"):
+            AdapterConfig.from_env(env)
+
+    @pytest.mark.parametrize("principal", ["", "  ", "svc account", "svc\taccount", "p" * 2049])
+    def test_command_principal_is_required(self, principal):
+        with pytest.raises(AdapterConfigError, match="BUZZ_COMMAND_PRINCIPAL"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_COMMAND_PRINCIPAL": principal})
+
+    def test_command_principal_may_use_the_relay_maximum(self):
+        principal = "p" * 2048
+        config = AdapterConfig.from_env({**_AGENTS, "BUZZ_COMMAND_PRINCIPAL": principal})
+        assert config.agents.command_principal == principal
+
+    @pytest.mark.parametrize("name", ["BUZZ_AGENT_GRANT_TTL_SECONDS", "BUZZ_MAX_AGENTS_PER_USER"])
+    @pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5"])
+    def test_agent_numbers_must_be_positive_integers(self, name, value):
+        with pytest.raises(AdapterConfigError, match=f"{name} must be a positive integer"):
+            AdapterConfig.from_env({**_AGENTS, name: value})
+
+    def test_grant_ttl_is_bounded(self):
+        with pytest.raises(AdapterConfigError, match="BUZZ_AGENT_GRANT_TTL_SECONDS must be at most"):
+            AdapterConfig.from_env({**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "2592001"})
+        assert AdapterConfig.from_env({**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "2592000"}).agents
+
+    def test_agent_number_overrides(self):
+        env = {**_AGENTS, "BUZZ_AGENT_GRANT_TTL_SECONDS": "86400", "BUZZ_MAX_AGENTS_PER_USER": "2"}
+        agents = AdapterConfig.from_env(env).agents
+        assert (agents.grant_ttl_seconds, agents.max_agents_per_user) == (86400, 2)
+
+
 class TestAssertionConfig:
     def test_enabled_config_carries_the_assertion_settings(self):
         config = AdapterConfig.from_env(_ENABLED)
@@ -143,7 +259,10 @@ class TestAssertionConfig:
             AdapterConfig.from_env({**_ENABLED, "BUZZ_RELAY_URLS": ""})
 
     def test_relays_are_a_comma_separated_list(self):
-        env = {**_ENABLED, "BUZZ_RELAY_URLS": "wss://a.example.com, wss://b.example.com:8443,wss://[2001:db8::1]"}
+        env = {
+            **_ENABLED,
+            "BUZZ_RELAY_URLS": "wss://a.example.com, wss://b.example.com:8443,wss://[2001:db8::1]",
+        }
         assert AdapterConfig.from_env(env).relay_urls == frozenset(
             {"wss://a.example.com", "wss://b.example.com:8443", "wss://[2001:db8::1]"}
         )
@@ -330,3 +449,30 @@ class TestFlagOffCallback:
         assert status == "302"
         assert "login_error=expired_flow" in location
         assert "127.0.0.1" not in location
+
+
+_PROBE_AGENT_ROUTES = (
+    "import json, main\n"
+    "from fastapi.testclient import TestClient\n"
+    "client = TestClient(main.app)\n"
+    "routes = ['agent-grant', 'agent-assertion', 'agent-revoke']\n"
+    "answers = [client.post('/nip-fa/v1/nip-fi/' + route) for route in routes]\n"
+    "print(json.dumps({\n"
+    "    'agents': main._BUZZ_ADAPTER_CONFIG.agents is not None,\n"
+    "    'answers': [[response.status_code, response.json()] for response in answers],\n"
+    "}))\n"
+)
+
+
+class TestAgentsOffAtImport:
+    """A host that already runs the adapter, deployed with this image and no
+    agent settings: it must start, and the agent routes must refuse."""
+
+    def test_adapter_starts_with_agents_unset_and_refuses_agent_routes(self):
+        env = {**_ENABLED, "LAUNCHPAD_EMAIL_CAPTURE": "false"}
+        assert "BUZZ_AGENTS_ENABLED" not in env
+        result = _run_main(_PROBE_AGENT_ROUTES, **env)
+        assert result.returncode == 0, result.stderr
+        probe = json.loads(result.stdout.strip().splitlines()[-1])
+        assert probe["agents"] is False
+        assert probe["answers"] == [[403, {"error": "agent_unsupported"}]] * 3

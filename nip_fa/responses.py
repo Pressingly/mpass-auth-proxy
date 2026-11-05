@@ -41,10 +41,24 @@ def request_too_large() -> JSONResponse:
     return denial(413, "request_too_large")
 
 
-def rate_limited(retry_after_seconds: int) -> JSONResponse:
+def rate_limited(retry_after_seconds: int | None) -> JSONResponse:
     response = denial(429, "rate_limited")
-    response.headers["Retry-After"] = str(retry_after_seconds)
+    if retry_after_seconds is not None:
+        response.headers["Retry-After"] = str(retry_after_seconds)
     return response
+
+
+def invalid_grant(status_code: int) -> JSONResponse:
+    """400 on the agent grant exchange, 401 on the agent assertion route."""
+    return denial(status_code, "invalid_grant")
+
+
+def agent_unsupported() -> JSONResponse:
+    return denial(403, "agent_unsupported")
+
+
+def agent_not_found() -> JSONResponse:
+    return denial(404, "agent_not_found")
 
 
 def issuance_unavailable() -> JSONResponse:

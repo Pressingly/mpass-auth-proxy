@@ -28,6 +28,9 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/nip-fa/v1/session` | Buzz NIP-FA session check (Bearer adapter session), revalidated against Cognito at most hourly |
 | `GET`  | `/nip-fa/v1/identity/key` | Our extension to NIP-FA (Bearer adapter session): returns the platform-held Nostr key `{nostr_pubkey, secret_key}` for the session's mPass ID, the same key on every device |
 | `POST` | `/nip-fa/v1/identity/assertions` | Buzz NIP-FA relay assertion (Bearer adapter session + `Nostr-Authorization` NIP-98 proof): returns a short-lived NIP-FI assertion `{assertion, nostr_pubkey, expires_at}` for an allowlisted relay |
+| `POST` | `/nip-fa/v1/nip-fi/agent-grant` | Buzz NIP-FA agent grant (RFC 8693 form with the owner's session as `subject_token`, a NIP-OA `owner_attestation`, and a NIP-98 proof by the agent key): enrolls the agent and returns an opaque grant (only when `BUZZ_AGENTS_ENABLED`) |
+| `POST` | `/nip-fa/v1/nip-fi/agent-assertion` | Buzz NIP-FA agent assertion (Bearer agent grant + NIP-98 proof by the agent key): returns a `nip-fi-agent+jwt` carrying `nostr_owner_pubkey` |
+| `POST` | `/nip-fa/v1/nip-fi/agent-revoke` | Buzz NIP-FA agent revocation (Bearer owner session, form `agent_pubkey`): revokes the agent for good and disconnects it on every relay |
 | `GET`  | `/.well-known/jwks.json` | Public signing key, served when `LAUNCHPAD_EMAIL_CAPTURE` or `BUZZ_ADAPTER_ENABLED` is on (404 otherwise) |
 
 ### Traefik routing — cross-repo invariant
@@ -117,10 +120,69 @@ rate_limited` with `Retry-After`). The claims are `iss`, `sub` (the mPass ID),
 `aud`, `iat`, `exp`, `nostr_pubkey` and, when the email local part meets the
 relay's username rules, `nostr_public_profile` `{display_name, username}`.
 
+### Buzz agent keys
+
+`BUZZ_AGENTS_ENABLED` (off by default, read only with the adapter on) turns on
+the NIP-FA "Agent keys" routes, following `docs/nips/NIP-FA.md` in block/buzz
+at b14899f. With it off they answer `403 agent_unsupported`, so the adapter
+never needs the settings below to start.
+
+- An owner enrolls an agent key with their adapter session (as `subject_token`,
+  never a header), a NIP-OA `auth` tag signed by their platform-held key, and a
+  NIP-98 proof signed by the agent key. Only empty attestation conditions are
+  accepted. An agent key belongs to its first owner for good, a revoked one
+  never enrolls again, a user's own Buzz key can never be an agent, and each
+  user may hold `BUZZ_MAX_AGENTS_PER_USER` agents with a live grant (default
+  5). Expired grants do not count, because clients delete agents without
+  revoking them; re-enrolling an expired agent is counted again.
+- The grant is opaque; launchpad's `buzz_agents` stores only its SHA-256. It
+  lasts `BUZZ_AGENT_GRANT_TTL_SECONDS` (default 691200, 8 days), use does not
+  extend it, and enrolling again replaces it.
+- Agent assertions have `typ` `nip-fi-agent+jwt`, `sub` the owner's mPass ID
+  and `nostr_owner_pubkey` the owner's key, with `exp` capped by the grant.
+  They stop the moment the agent is revoked, or its owner's
+  `buzz_identities.revoked_at` is set.
+- NIP-98 proofs on the grant and assertion routes are single-use (event ids are
+  remembered in Redis for 95 seconds, which covers clock drift between replicas).
+- Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
+  key and `kid`) and sends it to every relay's internal URL. The deny lasts
+  `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If
+  any relay does not confirm, the revocation stands but the route answers `503`
+  so the client retries, and a repeated revoke sends the disconnect again.
+
+**Do not turn `BUZZ_AGENTS_ENABLED` on before owner revocation ships.** A grant
+is not tied to the owner's adapter session, and nothing in this service sets
+`buzz_identities.revoked_at` yet: an owner whose mPass access ends (Cognito
+`invalid_grant`, corporate-ID gate) loses their sessions at the next hourly
+revalidation, but their agents keep getting assertions until the grant expires
+(up to `BUZZ_AGENT_GRANT_TTL_SECONDS`). Owner revocation must set that column
+and disconnect the owner's agents before the flag is on anywhere.
+
+`/nip-fa/v1/nip-fi/agent-assertion` looks a well-formed grant up in the
+launchpad database before any per-grant limit applies, on the pool email capture
+shares. Put a per-client rate limit on that path at the edge.
+
+It needs `BUZZ_RELAY_INTERNAL_URLS` (one per `BUZZ_RELAY_URLS` entry, same
+order) and `BUZZ_COMMAND_PRINCIPAL`, and optionally
+`BUZZ_RELAY_COMMAND_AUDIENCES`; `.env.example` describes each. Each relay's
+issuer policy then also needs:
+
+| Relay setting | Value |
+|---|---|
+| `command_audiences` | `https://` + the relay URL's authority, or that relay's `BUZZ_RELAY_COMMAND_AUDIENCES` entry |
+| `authorized_principals` | `BUZZ_COMMAND_PRINCIPAL` |
+| `maximum_command_age_seconds` | 1 to 60 (commands are sent as soon as they are signed) |
+| `maximum_assertion_age_seconds` and `skew_seconds` | `maximum_assertion_age_seconds` + `skew_seconds` above `BUZZ_ASSERTION_TTL_SECONDS` by at least the clock drift between this service and the relay. A disconnect's `until` is `now + BUZZ_ASSERTION_TTL_SECONDS` by this service's clock, and the relay refuses one past its own `now + skew + maximum_assertion_age`, so with no margin every revoke answers `503` |
+| token class | the dedicated NIP-FI class above, which admits `nip-fi-agent+jwt` too |
+
+Requests are limited to 10 grants and 10 revocations per adapter session and 30
+assertions per grant, per 60 seconds.
+
 **Deploy order:** `buzz_identities` and its grants come from launchpad-api's
 `sql/schema.sql`. Apply that schema (`python -m src.migrate`) before enabling
 the adapter here, or `/nip-fa/v1/identity/key` and `/nip-fa/v1/identity/assertions`
-answer `503 issuance_unavailable`.
+answer `503 issuance_unavailable`. The same goes for `buzz_agents` before
+`BUZZ_AGENTS_ENABLED`.
 
 Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
 the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),

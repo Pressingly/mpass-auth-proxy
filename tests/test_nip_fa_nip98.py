@@ -122,7 +122,8 @@ class TestNip98Verifier:
         return verify_http_auth(header, self._expected(body), now if now is not None else self._NOW)
 
     def test_known_good_event_verifies(self):
-        assert self._verify(encode_proof(self._event())) == VerifiedProof(pubkey_of(OTHER_SECRET))
+        event = self._event()
+        assert self._verify(encode_proof(event)) == VerifiedProof(pubkey_of(OTHER_SECRET), event["id"])
 
     def test_event_id_is_nip01(self):
         event = {"pubkey": "a" * 64, "created_at": 1, "kind": 27235, "tags": [["u", "é"]], "content": "x\n\"y"}
