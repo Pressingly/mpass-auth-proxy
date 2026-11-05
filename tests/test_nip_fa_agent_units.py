@@ -565,6 +565,7 @@ class TestLaunchpadAgentStore:
         assert await _store(connection).revoke("owner-1", _AGENT) is outcome
         assert connection.statements[0] == (agent_sql.REVOKE_SQL, (_AGENT, "owner-1"))
         assert "revoked_at IS NULL" in agent_sql.REVOKE_SQL
+        assert "revoked_at = clock_timestamp()" in agent_sql.REVOKE_SQL
 
     @pytest.mark.asyncio
     async def test_a_concurrently_enrolled_agent_is_not_reported_revoked(self):
