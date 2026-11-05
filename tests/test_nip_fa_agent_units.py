@@ -533,6 +533,12 @@ class TestLaunchpadAgentStore:
         assert "revoked_at IS NULL" in agent_sql.REVOKE_SQL
 
     @pytest.mark.asyncio
+    async def test_a_concurrently_enrolled_agent_is_not_reported_revoked(self):
+        connection = _ScriptedConnection({agent_sql.REVOKE_SQL: None, agent_sql.OWNED_AGENT_SQL: _row(revoked_at=None)})
+        with pytest.raises(AgentStoreUnavailable):
+            await _store(connection).revoke("owner-1", _AGENT)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("error", [asyncpg.PostgresError(), OSError(), TimeoutError()])
     async def test_database_errors_are_unavailable(self, error):
         store = _store(_ScriptedConnection({}, error=error))

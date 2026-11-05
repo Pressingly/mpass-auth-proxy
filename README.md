@@ -141,7 +141,7 @@ never needs the settings below to start.
   They stop the moment the agent is revoked, or its owner's
   `buzz_identities.revoked_at` is set.
 - NIP-98 proofs on the grant and assertion routes are single-use (event ids are
-  remembered in Redis for 66 seconds).
+  remembered in Redis for 95 seconds, which covers clock drift between replicas).
 - Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
   key and `kid`) and sends it to every relay's internal URL. The deny lasts
   `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If

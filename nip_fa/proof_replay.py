@@ -6,8 +6,10 @@ from redis.exceptions import RedisError
 from .nip98 import MAX_AGE_SECONDS, MAX_FUTURE_SECONDS
 
 # A proof dated MAX_FUTURE_SECONDS ahead stays acceptable for MAX_AGE_SECONDS
-# after that, so its id must be remembered at least that long.
-PROOF_MEMORY_SECONDS = MAX_AGE_SECONDS + MAX_FUTURE_SECONDS + 1
+# after that, so its id must be remembered at least that long, plus a margin
+# for clock drift between replicas sharing the record.
+CLOCK_DRIFT_MARGIN_SECONDS = 30
+PROOF_MEMORY_SECONDS = MAX_AGE_SECONDS + MAX_FUTURE_SECONDS + CLOCK_DRIFT_MARGIN_SECONDS
 
 
 class ReplayGuardUnavailable(Exception):

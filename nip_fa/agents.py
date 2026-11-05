@@ -49,6 +49,11 @@ class AgentStoreUnavailable(Exception):
     """The agent store could not be asked."""
 
 
+class EnrollmentRaced(AgentStoreUnavailable):
+    """The agent was enrolled between the revoke and its read-back; the
+    caller retries rather than report a live agent as revoked."""
+
+
 class Enrollment(enum.Enum):
     ENROLLED = "enrolled"
     OWNER_REFUSED = "owner_refused"
@@ -182,6 +187,10 @@ class LaunchpadAgentStore:
             if await conn.fetchval(REVOKE_SQL, agent_pubkey, owner_sub):
                 return Revocation.REVOKED
             owned = await conn.fetchrow(OWNED_AGENT_SQL, agent_pubkey, owner_sub)
-            return Revocation.NOT_FOUND if owned is None else Revocation.ALREADY_REVOKED
+            if owned is None:
+                return Revocation.NOT_FOUND
+            if owned["revoked_at"] is None:
+                raise EnrollmentRaced()
+            return Revocation.ALREADY_REVOKED
 
         return await self._run(operation)
