@@ -23,6 +23,17 @@ FastAPI + uvicorn, Redis/Valkey for short-lived bridge state.
 | `GET`  | `/mpass/login` | Redirects to `/oauth2/sign_in` — re-initiates SSO after a 401 |
 | `GET`  | `/mpass/logout` | Clears the `mpass_bridge` cookie, then `302` to `/oauth2/sign_out`, optionally chaining through the IdP sign-out |
 | `GET`  | `/health` | Liveness check |
+| `GET`  | `/nip-fa/v1/login/start` | Buzz NIP-FA browser login: validates the loopback `return_to` and S256 handoff challenge, then joins the Moneta login (only when `BUZZ_ADAPTER_ENABLED`) |
+| `POST` | `/nip-fa/v1/login/exchange` | Buzz NIP-FA code exchange: single-use code + handoff secret for an adapter session |
+| `GET`  | `/nip-fa/v1/session` | Buzz NIP-FA session check (Bearer adapter session), revalidated against Cognito at most hourly |
+| `GET`  | `/nip-fa/v1/identity/key` | Our extension to NIP-FA (Bearer adapter session): returns the platform-held Nostr key `{nostr_pubkey, secret_key}` for the session's mPass ID, the same key on every device |
+| `POST` | `/nip-fa/v1/identity/assertions` | Buzz NIP-FA relay assertion (Bearer adapter session + `Nostr-Authorization` NIP-98 proof): returns a short-lived NIP-FI assertion `{assertion, nostr_pubkey, expires_at}` for an allowlisted relay |
+| `POST` | `/nip-fa/v1/nip-fi/agent-grant` | Buzz NIP-FA agent grant (RFC 8693 form with the owner's session as `subject_token`, a NIP-OA `owner_attestation`, and a NIP-98 proof by the agent key): enrolls the agent and returns an opaque grant (only when `BUZZ_AGENTS_ENABLED`) |
+| `POST` | `/nip-fa/v1/nip-fi/agent-assertion` | Buzz NIP-FA agent assertion (Bearer agent grant + NIP-98 proof by the agent key): returns a `nip-fi-agent+jwt` carrying `nostr_owner_pubkey` |
+| `POST` | `/nip-fa/v1/nip-fi/agent-revoke` | Buzz NIP-FA agent revocation (Bearer owner session, form `agent_pubkey`): revokes the agent for good and disconnects it on every relay |
+| `POST` | `/internal/nip-fa/v1/identity/revoke` | Internal, never routed publicly (Bearer `BUZZ_ADMIN_TOKEN`, JSON `{"mpass_id"}`): revokes a user's Buzz identity for good, ends their adapter sessions and login codes, and disconnects their key on every relay (only when `BUZZ_REVOCATION_ENABLED`) |
+| `GET`  | `/internal/nip-fa/v1/identity/pubkey?mpass_id=` | Internal, never routed publicly (Bearer `BUZZ_ADMIN_TOKEN`): the stored Buzz pubkey for an mPass ID, `404` until the user has signed in to Buzz once |
+| `GET`  | `/.well-known/jwks.json` | Public signing key, served when `LAUNCHPAD_EMAIL_CAPTURE` or `BUZZ_ADAPTER_ENABLED` is on (404 otherwise) |
 
 ### Traefik routing — cross-repo invariant
 
@@ -35,7 +46,16 @@ so auth breaks silently rather than erroring.
 The router rule does **not** live in this repository. It is the
 `traefik.http.routers.mpass-bridge.rule` label on the `mpass-auth-proxy` service
 in `docker-compose.yml` in `Pressingly/foss-server-bundle` (private), and it
-currently lists exactly the six paths in the table above.
+lists the non-Buzz paths in the table above, including `/.well-known/jwks.json`.
+Every public Buzz adapter route lives under `/nip-fa/` (see `nip_fa/`), so the
+rule needs one `PathPrefix(`/nip-fa/`)` for all of them rather than a `Path()`
+per route. That entry is **not there yet**: it lands with the bundle's Buzz
+work, and until then no `/nip-fa/` route is reachable through Traefik.
+
+The `/internal/` routes are the exception: they must **never** be added to any
+Traefik router. Operators reach them on the service's internal hostname, for
+example `http://mpass-auth-proxy:8000/internal/...` from inside the Docker
+network; on the public host they fall through to the oauth2-proxy catch-all.
 
 So adding, renaming or removing a route here is a **two-repo change**: land the
 route in this repo, then open a coordinated PR against foss-server-bundle
@@ -55,6 +75,176 @@ Required: `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `MONETA_HOSTED_UI_URL`,
 Optional: `OIDC_CLIENT_SECRET`, `SESSION_COOKIE_MAX_AGE_SECONDS`,
 `OIDC_LOGOUT_URI`, `LOGOUT_REDIRECT_URL`, `SMB_CORPORATE_ID`, `PORTAL_URL`,
 `LOG_LEVEL`.
+
+The Buzz NIP-FA adapter (`BUZZ_ADAPTER_ENABLED`, off by default) requires
+`BUZZ_IDENTITY_MASTER_SECRET` (64 hex characters), `BUZZ_IDENTITY_SALT` (hex,
+32 to 128 characters) and `LAUNCHPAD_DB_PASSWORD`, and reads the optional
+`BUZZ_ADAPTER_SESSION_TTL_SECONDS` (default 2592000, 30 days). The service
+refuses to start with the flag on and any of the three missing or malformed.
+
+Each user's Nostr key is
+`HKDF-SHA256(ikm=master secret, salt=identity salt, info="moneta-buzz/nostr-key/v1|" + uint16_be(len(mPass ID)) + mPass ID + attempt byte)`,
+where the attempt byte is 0 unless that scalar is out of range for secp256k1,
+so changing either value re-keys every Buzz user. The first issuance binds the
+public key in launchpad's `buzz_identities` table; a later derivation that no
+longer matches it is refused with `binding_mismatch` rather than issuing a new
+identity. The master secret also seals the adapter's Redis records, so rotating
+it signs every Buzz session out.
+
+### Buzz relay assertions
+
+`POST /nip-fa/v1/identity/assertions` issues the NIP-FI assertion a Buzz client
+presents to a relay. It needs:
+
+- `BUZZ_NIP_FI_ISSUER` (required): the exact `iss` string, an https URL with no
+  trailing slash. It must differ from `MPASS_PROXY_ISSUER_URL`.
+- `BUZZ_RELAY_URLS` (required): comma-separated canonical relay URLs,
+  `wss://host[:port]` in lowercase, default port omitted, no port 80, no trailing
+  slash, path, query or fragment. A non-canonical entry refuses startup; requests
+  are compared against the list exactly.
+- `BUZZ_ASSERTION_TTL_SECONDS` (default 300, 30 to 3600): assertion lifetime,
+  capped by the adapter session's expiry.
+- `BUZZ_ADAPTER_PUBLIC_ORIGIN` (optional): the origin Buzz clients reach this
+  service on. The NIP-98 `u` tag must equal `<origin>/nip-fa/v1/identity/assertions`
+  exactly. It defaults to the `MPASS_CALLBACK_URL` origin; behind Traefik the
+  request URL is the internal one, so it is never used.
+- A signing key: assertions are RS256 with the same key and `kid` email capture
+  uses, so with the adapter on the service loads it (and serves the JWKS) even
+  with capture off, from the sources `.env.example` lists.
+
+Each Buzz relay's NIP-FI issuer policy must match, or the relay rejects every
+assertion:
+
+| Relay setting | Value |
+|---|---|
+| issuer | `BUZZ_NIP_FI_ISSUER`, byte for byte |
+| `jwks_uri` | `<adapter origin>/.well-known/jwks.json` |
+| token class | dedicated NIP-FI (`typ` `nip-fi+jwt`), `RS256` |
+| community audience | `https://` + the relay URL's authority, e.g. `wss://chat.example.com` → `https://chat.example.com` |
+| `maximum_assertion_age_seconds` | at least `BUZZ_ASSERTION_TTL_SECONDS` |
+
+Requests are limited to 30 per adapter session per 60 seconds (`429
+rate_limited` with `Retry-After`). The claims are `iss`, `sub` (the mPass ID),
+`aud`, `iat`, `exp`, `nostr_pubkey` and, when the email local part meets the
+relay's username rules, `nostr_public_profile` `{display_name, username}`.
+
+### Buzz agent keys
+
+`BUZZ_AGENTS_ENABLED` (off by default, read only with the adapter on) turns on
+the NIP-FA "Agent keys" routes, following `docs/nips/NIP-FA.md` in block/buzz
+at b14899f. With it off they answer `403 agent_unsupported`. It needs
+`BUZZ_REVOCATION_ENABLED` (below): the service refuses to start with agents on
+and owner revocation off, because an agent must stop when its owner is revoked.
+
+- An owner enrolls an agent key with their adapter session (as `subject_token`,
+  never a header), a NIP-OA `auth` tag signed by their platform-held key, and a
+  NIP-98 proof signed by the agent key. Only empty attestation conditions are
+  accepted. An agent key belongs to its first owner for good, a revoked one
+  never enrolls again, a user's own Buzz key can never be an agent, and each
+  user may hold `BUZZ_MAX_AGENTS_PER_USER` agents with a live grant (default
+  5). Expired grants do not count, because clients delete agents without
+  revoking them; re-enrolling an expired agent is counted again.
+- The grant is opaque; launchpad's `buzz_agents` stores only its SHA-256. It
+  lasts `BUZZ_AGENT_GRANT_TTL_SECONDS` (default 691200, 8 days), use does not
+  extend it, and enrolling again replaces it.
+- Agent assertions have `typ` `nip-fi-agent+jwt`, `sub` the owner's mPass ID
+  and `nostr_owner_pubkey` the owner's key, with `exp` capped by the grant.
+  They stop the moment the agent is revoked, or its owner's
+  `buzz_identities.revoked_at` is set.
+- The current buzz-app desktop (block/buzz-app 9c94152) still enrolls in its
+  older Builderlab form, and `BUZZ_AGENTS_ACCEPT_LEGACY_CLIENT` (on by default)
+  accepts it on the grant route as an alias of the spec form:
+  `subject_token_type` `urn:builderlab:params:oauth:token-type:bb-session`,
+  `requested_token_type` `urn:builderlab:params:oauth:token-type:nip-fi-agent-grant`
+  (echoed back as `issued_token_type`), a seventh field `runtime=local`, and the
+  NIP-98 proof in `Nostr-Agent-Proof` instead of `Nostr-Authorization`. A
+  request takes one form whole: both proof headers, or the legacy header with
+  any spec field (or the reverse), is `400 invalid_request`. Everything after
+  parsing is the same code: proof verification, single use, owner attestation,
+  cap, rate limit and revocation. The client's assertion request is already the
+  spec form. Turn the flag off, and later delete the dialect, once buzz-app's
+  `src-tauri/src/federated_identity/agent/mod.rs` sends the `urn:nostr:` token
+  types and `Nostr-Authorization`, and our desktop build has picked that up.
+- NIP-98 proofs on the grant and assertion routes are single-use (event ids are
+  remembered in Redis for 95 seconds, which covers clock drift between replicas).
+- Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
+  key and `kid`) and sends it to every relay's internal URL. The deny lasts
+  `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If
+  any relay does not confirm, the revocation stands but the route answers `503`
+  so the client retries, and a repeated revoke sends the disconnect again.
+
+A grant is not tied to the owner's adapter session: an owner whose mPass access
+ends loses their sessions at the next hourly revalidation, but their agents
+keep getting assertions until the grant expires. Offboarding therefore has to
+call the owner revocation below, which ends every grant at once.
+
+`/nip-fa/v1/nip-fi/agent-assertion` looks a well-formed grant up in the
+launchpad database before any per-grant limit applies, on the pool email capture
+shares. Put a per-client rate limit on that path at the edge.
+
+Requests are limited to 10 grants and 10 revocations per adapter session and 30
+assertions per grant, per 60 seconds.
+
+### Buzz owner revocation
+
+`BUZZ_REVOCATION_ENABLED` (off by default, read only with the adapter on)
+mounts the two internal routes in the table above and starts the relay deny
+re-push. It needs `BUZZ_ADMIN_TOKEN` (at least 32 characters, e.g.
+`openssl rand -hex 32`), `BUZZ_RELAY_INTERNAL_URLS` (one per `BUZZ_RELAY_URLS`
+entry, same order) and `BUZZ_COMMAND_PRINCIPAL`, and optionally
+`BUZZ_RELAY_COMMAND_AUDIENCES`; `.env.example` describes each.
+
+Revoking an mPass ID (offboarding):
+
+```bash
+curl -sS -X POST http://mpass-auth-proxy:8000/internal/nip-fa/v1/identity/revoke \
+  -H "Authorization: Bearer $BUZZ_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"mpass_id": "<cognito:username>"}'
+```
+
+- Sets `buzz_identities.revoked_at` once; it never clears, so the user can
+  never get their Buzz key or an assertion again, even after signing in again.
+- Ends the user's adapter sessions and unexchanged login codes at once, through
+  a Redis tombstone kept for `BUZZ_ADAPTER_SESSION_TTL_SECONDS`.
+- Ends every agent grant the user authorized: a grant is usable only while its
+  owner is not revoked, and no new agent can enroll under a revoked owner.
+- Disconnects the user's key on every relay, until the later of `revoked_at`
+  (rounded up) and this service's clock after the commit, plus
+  `BUZZ_ASSERTION_TTL_SECONDS`: every assertion issued before the revocation
+  took effect has expired by then. One disconnect covers the user's agents too: the
+  relay closes sessions whose recorded owner is the target, and denies an agent
+  assertion whose owner it has denied (NIP-FI "Agent keys").
+- Answers `{"revoked": true, "nostr_pubkey"}`, or `{"revoked": false}` for a
+  user who never bound a key. Their sessions still end and no key is issued to
+  them while the tombstone lasts (`BUZZ_ADAPTER_SESSION_TTL_SECONDS`), but
+  nothing is recorded in the database, so offboarding must also end their mPass
+  access, as it does today. `503 unavailable` means
+  retry: every step is idempotent, and a repeat sends the disconnect again.
+
+A relay keeps its deny set in memory and forgets it on restart, without telling
+the issuer. So while revocation is on, every replica re-sends, every 30
+seconds, the disconnect for each owner or agent key revoked within the last
+`BUZZ_ASSERTION_TTL_SECONDS`, anchored on the stored revocation time (up to 8
+keys at a time). A restarted relay can therefore readmit a revoked key, with an
+assertion issued before the revocation, for at most 30 seconds plus the time
+one re-push takes; that grows by the relay timeout (5 seconds per batch of 8
+keys) while some relay is unreachable.
+
+Each relay's issuer policy needs:
+
+| Relay setting | Value |
+|---|---|
+| `command_audiences` | `https://` + the relay URL's authority, or that relay's `BUZZ_RELAY_COMMAND_AUDIENCES` entry |
+| `authorized_principals` | `BUZZ_COMMAND_PRINCIPAL` |
+| `maximum_command_age_seconds` | 1 to 60 (commands are sent as soon as they are signed) |
+| `maximum_assertion_age_seconds` and `skew_seconds` | `maximum_assertion_age_seconds` + `skew_seconds` above `BUZZ_ASSERTION_TTL_SECONDS` by at least the clock drift between this service and the relay plus one second (owner denies are rounded up to the second). A disconnect's `until` is `now + BUZZ_ASSERTION_TTL_SECONDS` by this service's clock, and the relay refuses one past its own `now + skew + maximum_assertion_age`, so with no margin every revoke answers `503` |
+| token class | the dedicated NIP-FI class above, which admits `nip-fi-agent+jwt` too |
+
+**Deploy order:** `buzz_identities` and its grants come from launchpad-api's
+`sql/schema.sql`. Apply that schema (`python -m src.migrate`) before enabling
+the adapter here, or `/nip-fa/v1/identity/key` and `/nip-fa/v1/identity/assertions`
+answer `503 issuance_unavailable`. The same goes for `buzz_agents` before
+`BUZZ_AGENTS_ENABLED` or `BUZZ_REVOCATION_ENABLED`.
 
 Launchpad email capture (`LAUNCHPAD_EMAIL_CAPTURE`) adds its own required set:
 the signing key (`MPASS_SIGNING_KEY_B64` or the `MPASS_SIGNING_KEY_GCP_*` pair),
