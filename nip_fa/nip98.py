@@ -21,8 +21,8 @@ from coincurve import PublicKeyXOnly
 from .bodies import strict_json_loads
 
 HTTP_AUTH_KIND = 27235
-MAX_AGE_SECONDS = 60
-MAX_FUTURE_SECONDS = 5
+MAX_AGE_SECONDS = 120
+MAX_FUTURE_SECONDS = 120
 MAX_HEADER_CHARS = 8192
 SCHEME = "nostr"
 EVENT_FIELDS = frozenset({"id", "pubkey", "created_at", "kind", "tags", "content", "sig"})

@@ -44,6 +44,7 @@ from nip_fa.owner_attestation import (
     signing_digest,
     verified_owner,
 )
+from nip_fa.nip98 import MAX_AGE_SECONDS, MAX_FUTURE_SECONDS
 from nip_fa.proof_replay import PROOF_MEMORY_SECONDS, ProofReplayGuard, ReplayGuardUnavailable
 from nip_fa.relay_commands import (
     COMMAND_TTL_SECONDS,
@@ -248,7 +249,7 @@ class TestProofReplayGuard:
         assert redis.calls[0] == ("nip_fa_proof:agent-grant:e1", True, PROOF_MEMORY_SECONDS)
 
     def test_memory_outlasts_the_proof_window(self):
-        assert PROOF_MEMORY_SECONDS > 60 + 5
+        assert PROOF_MEMORY_SECONDS > MAX_AGE_SECONDS + MAX_FUTURE_SECONDS
 
     @pytest.mark.asyncio
     async def test_redis_failure_is_unavailable(self):
