@@ -166,7 +166,11 @@ class TestNip98Verifier:
         assert self._verify(encode_proof(self._event(kind=1))) is ProofFailure.WRONG_KIND
 
     @pytest.mark.parametrize("age, expected", [
-        (0, None), (60, None), (61, ProofFailure.STALE), (-5, None), (-6, ProofFailure.FUTURE),
+        (0, None),
+        (nip98.MAX_AGE_SECONDS, None),
+        (nip98.MAX_AGE_SECONDS + 1, ProofFailure.STALE),
+        (-nip98.MAX_FUTURE_SECONDS, None),
+        (-nip98.MAX_FUTURE_SECONDS - 1, ProofFailure.FUTURE),
     ])
     def test_created_at_window(self, age, expected):
         result = self._verify(encode_proof(self._event(created_at=self._NOW - age)))

@@ -14,6 +14,7 @@ import main as m
 from nip_fa.adapter import ASSERTION_RATE_LIMIT, ASSERTION_RATE_WINDOW_SECONDS
 from nip_fa.assertions import AssertionRateLimiter, is_publishable_profile, parse_assertion_body
 from nip_fa.identities import IdentityStoreUnavailable, StoredIdentity
+from nip_fa.nip98 import MAX_AGE_SECONDS, MAX_FUTURE_SECONDS
 from nip_fa.sessions import REVALIDATION_INTERVAL_SECONDS, Identity, session_key
 from nip_fa.urls import relay_audience
 from tests.test_main import (  # noqa: F401  (autouse fixtures apply by import)
@@ -429,8 +430,8 @@ class TestProofDenials:
         ("internal u", lambda body: _proof(body, tags=_tags(body, url="http://testserver" + _ROUTE))),
         ("wrong method", lambda body: _proof(body, tags=_tags(body, method="GET"))),
         ("wrong payload", lambda body: _proof(body, tags=_tags(b"other body"))),
-        ("stale", lambda body: _proof(body, created_at=_T0 - 61)),
-        ("future", lambda body: _proof(body, created_at=_T0 + 6)),
+        ("stale", lambda body: _proof(body, created_at=_T0 - MAX_AGE_SECONDS - 1)),
+        ("future", lambda body: _proof(body, created_at=_T0 + MAX_FUTURE_SECONDS + 1)),
         ("not base64", lambda body: "Nostr !!!"),
         ("wrong scheme", lambda body: "Bearer " + _proof(body)[len("Nostr "):]),
     ])
@@ -459,7 +460,7 @@ class TestProofDenials:
 
     def test_proof_window_edges_are_accepted(self, redis_store, clock, identity_store):
         token = _signed_in(redis_store, clock)
-        for created_at in (_T0 - 60, _T0 + 5):
+        for created_at in (_T0 - MAX_AGE_SECONDS, _T0 + MAX_FUTURE_SECONDS):
             body = _body()
             assert _request_assertion(token, body=body, proof=_proof(body, created_at=created_at)).status_code == 200
 
@@ -475,7 +476,7 @@ class TestAuthorizationDenials:
     def test_proof_is_checked_before_the_relay(self, redis_store, clock, identity_store):
         token = _signed_in(redis_store, clock)
         body = _body(relay_url="wss://unknown.example.com")
-        response = _request_assertion(token, body=body, proof=_proof(body, created_at=_T0 - 61))
+        response = _request_assertion(token, body=body, proof=_proof(body, created_at=_T0 - MAX_AGE_SECONDS - 1))
         assert _denial(response) == (403, {"error": "invalid_proof"})
 
     def test_revoked_identity_is_authorization_denied(self, redis_store, clock, identity_store):
@@ -567,7 +568,7 @@ class TestAssertionLogging:
             proof = _proof(body)
             response = _request_assertion(token, body=body, proof=proof)
             bad_body = _body(relay_url="wss://unknown.example.com")
-            bad_proof = _proof(bad_body, created_at=_T0 - 61)
+            bad_proof = _proof(bad_body, created_at=_T0 - MAX_AGE_SECONDS - 1)
             assert _request_assertion(token, body=bad_body, proof=bad_proof).status_code == 403
 
         assertion = response.json()["assertion"]

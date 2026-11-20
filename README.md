@@ -165,8 +165,11 @@ and owner revocation off, because an agent must stop when its owner is revoked.
   spec form. Turn the flag off, and later delete the dialect, once buzz-app's
   `src-tauri/src/federated_identity/agent/mod.rs` sends the `urn:nostr:` token
   types and `Nostr-Authorization`, and our desktop build has picked that up.
-- NIP-98 proofs on the grant and assertion routes are single-use (event ids are
-  remembered in Redis for 95 seconds, which covers clock drift between replicas).
+- NIP-98 proofs on the agent-grant and agent-assertion routes are single-use
+  (event ids are remembered in Redis for 270 seconds: the ±120-second proof
+  window plus a margin for clock drift between replicas). Proofs on
+  `/nip-fa/v1/identity/assertions` are not: they stay reusable within that
+  window, bound to the route's `u`, method and payload hash.
 - Revoking signs a NIP-FI disconnect command (`typ` `nip-fi-command+jwt`, same
   key and `kid`) and sends it to every relay's internal URL. The deny lasts
   `BUZZ_ASSERTION_TTL_SECONDS`, outlasting every assertion already issued. If
