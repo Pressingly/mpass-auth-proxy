@@ -2356,6 +2356,9 @@ class TestExtraRedirectUris:
         "https://access.central.example.net\\@attacker.com/v1/connect/callback",
         "https://access.central.example.net/v1/connect/call\tback",
         "https://access.central.example.net/v1/connect/callback\n",
+        "https://access.central.example.net:8443:443/v1/connect/callback",
+        "https://access.central.example.net:443:443/v1/connect/callback",
+        "https://[::1]evil/v1/connect/callback",
     ])
     def test_near_misses_are_rejected(self, central_callback_allowed, redirect_uri):
         assert _authorize_with(redirect_uri).status_code == 400
@@ -2367,6 +2370,16 @@ class TestExtraRedirectUris:
 
     def test_platform_suffix_rule_still_applies_when_set(self, central_callback_allowed):
         assert _authorize_with(_REDIRECT_URI).status_code == 302
+
+    @pytest.mark.parametrize("uri", [
+        "https://a.example.net:8443:443/cb",
+        "https://a.example.net:443:443/cb",
+        "https://[::1]:8443]/cb",
+        "https://[::1]x/cb",
+        "https://[::1]evil/cb",
+    ])
+    def test_malformed_netlocs_have_no_key(self, uri):
+        assert m._redirect_key(uri) is None
 
     def test_explicit_port_and_ipv6_entries_keep_their_port(self):
         parsed = m._parse_extra_redirect_uris("https://access.example.net:8443/cb,https://[2001:db8::1]:9443/cb")
@@ -2390,6 +2403,8 @@ class TestExtraRedirectUris:
         "https://access.central.example.net:0443/v1/connect/callback",
         "https://access.central.example.net",
         "access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net:8443:443/v1/connect/callback",
+        "https://[::1]:8443]/v1/connect/callback",
     ])
     def test_bad_entry_is_refused(self, entry):
         with pytest.raises(RuntimeError, match="EXTRA_REDIRECT_URIS entry"):

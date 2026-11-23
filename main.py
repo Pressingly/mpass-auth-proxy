@@ -143,7 +143,10 @@ def _redirect_key(uri: str) -> _RedirectKey | None:
     query, a fragment or a non-canonical port. The path is kept byte for byte."""
     if _has_ambiguous_characters(uri):
         return None
-    parts = urlsplit(uri)
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return None
     if parts.scheme != "https" or not parts.hostname or not parts.path.startswith("/"):
         return None
     port = _exact_port(parts.netloc)
@@ -159,10 +162,28 @@ def _exact_port(netloc: str) -> int | None:
     """443 when no port is written, the port when it is written canonically
     (1-65535, no sign or leading zero), else None. urlsplit alone would read
     `:0` as no port and `:0443` as 443."""
-    _, bracket, after_ipv6 = netloc.rpartition("]")
-    _, colon, text = (after_ipv6 if bracket else netloc).rpartition(":")
+    ipv6_host, bracket, after_ipv6 = netloc.rpartition("]")
+    if bracket:
+        return _bracketed_port(ipv6_host, after_ipv6)
+    host, colon, text = netloc.rpartition(":")
     if not colon:
         return 443
+    if ":" in host:
+        return None
+    return _canonical_port(text)
+
+
+def _bracketed_port(ipv6_host: str, after: str) -> int | None:
+    if not ipv6_host.startswith("[") or "]" in ipv6_host:
+        return None
+    if not after:
+        return 443
+    if not after.startswith(":"):
+        return None
+    return _canonical_port(after[1:])
+
+
+def _canonical_port(text: str) -> int | None:
     if not _CANONICAL_PORT.fullmatch(text) or int(text) > 65535:
         return None
     return int(text)
@@ -186,7 +207,10 @@ _EXTRA_REDIRECT_URIS: frozenset[_RedirectKey] = _parse_extra_redirect_uris(
 
 
 def _is_allowed_redirect_uri(redirect_uri: str) -> bool:
-    netloc = urlparse(redirect_uri).netloc
+    try:
+        netloc = urlparse(redirect_uri).netloc
+    except ValueError:
+        return False
     if netloc and netloc.endswith(_PLATFORM_DOMAIN_SUFFIX):
         return True
     key = _redirect_key(redirect_uri)
