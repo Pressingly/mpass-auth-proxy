@@ -74,7 +74,18 @@ Required: `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `MONETA_HOSTED_UI_URL`,
 
 Optional: `OIDC_CLIENT_SECRET`, `SESSION_COOKIE_MAX_AGE_SECONDS`,
 `OIDC_LOGOUT_URI`, `LOGOUT_REDIRECT_URL`, `SMB_CORPORATE_ID`, `PORTAL_URL`,
-`LOG_LEVEL`.
+`LOG_LEVEL`, `EXTRA_REDIRECT_URIS`.
+
+`/authorize` accepts a `redirect_uri` whose host ends with the platform suffix
+(the `MPASS_CALLBACK_URL` host minus its leading `auth`). `EXTRA_REDIRECT_URIS`
+adds a comma-separated list of exact redirect URIs accepted on top of that, for
+a callback that lives outside the platform domain, such as access-api's central
+`https://access.foss.askii.ai/v1/connect/callback`. Each entry must be
+`https://host[:port]/path` with no userinfo, query or fragment; a request
+matches only when its scheme, host, port and path are the same (host case and
+an explicit `:443` aside), and any query, fragment, userinfo, whitespace or
+backslash rejects it. A malformed entry stops the service at startup. Unset or
+empty turns the list off.
 
 The Buzz NIP-FA adapter (`BUZZ_ADAPTER_ENABLED`, off by default) requires
 `BUZZ_IDENTITY_MASTER_SECRET` (64 hex characters), `BUZZ_IDENTITY_SALT` (hex,

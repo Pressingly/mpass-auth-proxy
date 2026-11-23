@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urlsplit
 
 import asyncpg
 import httpx
@@ -122,6 +122,61 @@ SMB_CORPORATE_ID: str = os.environ.get("SMB_CORPORATE_ID", "").strip()
 # accepted.
 _CALLBACK_HOST: str = urlparse(MPASS_CALLBACK_URL).netloc
 _PLATFORM_DOMAIN_SUFFIX: str = _CALLBACK_HOST.removeprefix("auth")
+
+_RedirectKey = tuple[str, str, int, str]
+_AMBIGUOUS_URI_CHARACTERS = frozenset("@?#\\")
+
+
+def _has_ambiguous_characters(uri: str) -> bool:
+    """urlsplit silently drops tabs and newlines and parsers disagree on
+    backslashes, so any of them could make two different URIs compare equal."""
+    return any(_is_ambiguous_character(char) for char in uri)
+
+
+def _is_ambiguous_character(char: str) -> bool:
+    return not char.isascii() or not char.isprintable() or char.isspace() or char in _AMBIGUOUS_URI_CHARACTERS
+
+
+def _redirect_key(uri: str) -> _RedirectKey | None:
+    """(scheme, host, port, path) of a plain https URI, or None when it has
+    anything an exact match must not paper over: another scheme, userinfo, a
+    query, a fragment or a bad port. The path is kept byte for byte."""
+    if _has_ambiguous_characters(uri):
+        return None
+    parts = urlsplit(uri)
+    if parts.scheme != "https" or not parts.hostname or not parts.path.startswith("/"):
+        return None
+    try:
+        port = parts.port or 443
+    except ValueError:
+        return None
+    return parts.scheme, parts.hostname, port, parts.path
+
+
+def _parse_extra_redirect_uris(raw: str) -> frozenset[_RedirectKey]:
+    entries = [entry.strip() for entry in raw.split(",") if entry.strip()]
+    keys = {entry: _redirect_key(entry) for entry in entries}
+    invalid = [entry for entry, key in keys.items() if key is None]
+    if invalid:
+        raise RuntimeError(
+            f"EXTRA_REDIRECT_URIS entry {invalid[0]!r} is not an exact redirect URI: "
+            "use https://host[:port]/path with no userinfo, query or fragment"
+        )
+    return frozenset(keys.values())
+
+
+_EXTRA_REDIRECT_URIS: frozenset[_RedirectKey] = _parse_extra_redirect_uris(
+    os.environ.get("EXTRA_REDIRECT_URIS", "")
+)
+
+
+def _is_allowed_redirect_uri(redirect_uri: str) -> bool:
+    netloc = urlparse(redirect_uri).netloc
+    if netloc and netloc.endswith(_PLATFORM_DOMAIN_SUFFIX):
+        return True
+    key = _redirect_key(redirect_uri)
+    return key is not None and key in _EXTRA_REDIRECT_URIS
+
 
 # Portal URL — where user-facing callback failures redirect. Derived from the
 # callback host by stripping the `auth.` subdomain (e.g. auth.local.moneta.dev
@@ -850,8 +905,7 @@ async def bridge_authorize(request: Request) -> Response:
     if code_challenge_method != "S256":
         return Response(status_code=400, content="Only S256 code_challenge_method is supported")
 
-    parsed = urlparse(redirect_uri)
-    if not parsed.netloc or not parsed.netloc.endswith(_PLATFORM_DOMAIN_SUFFIX):
+    if not _is_allowed_redirect_uri(redirect_uri):
         return Response(status_code=400, content="Invalid redirect_uri")
 
     return await _begin_moneta_login(state, {
