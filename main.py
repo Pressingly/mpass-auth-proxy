@@ -140,17 +140,32 @@ def _is_ambiguous_character(char: str) -> bool:
 def _redirect_key(uri: str) -> _RedirectKey | None:
     """(scheme, host, port, path) of a plain https URI, or None when it has
     anything an exact match must not paper over: another scheme, userinfo, a
-    query, a fragment or a bad port. The path is kept byte for byte."""
+    query, a fragment or a non-canonical port. The path is kept byte for byte."""
     if _has_ambiguous_characters(uri):
         return None
     parts = urlsplit(uri)
     if parts.scheme != "https" or not parts.hostname or not parts.path.startswith("/"):
         return None
-    try:
-        port = parts.port or 443
-    except ValueError:
+    port = _exact_port(parts.netloc)
+    if port is None:
         return None
     return parts.scheme, parts.hostname, port, parts.path
+
+
+_CANONICAL_PORT = re.compile(r"[1-9][0-9]{0,4}")
+
+
+def _exact_port(netloc: str) -> int | None:
+    """443 when no port is written, the port when it is written canonically
+    (1-65535, no sign or leading zero), else None. urlsplit alone would read
+    `:0` as no port and `:0443` as 443."""
+    _, bracket, after_ipv6 = netloc.rpartition("]")
+    _, colon, text = (after_ipv6 if bracket else netloc).rpartition(":")
+    if not colon:
+        return 443
+    if not _CANONICAL_PORT.fullmatch(text) or int(text) > 65535:
+        return None
+    return int(text)
 
 
 def _parse_extra_redirect_uris(raw: str) -> frozenset[_RedirectKey]:

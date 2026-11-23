@@ -2345,6 +2345,10 @@ class TestExtraRedirectUris:
         "https://access.central.example.net/v1/connect/callback?",
         "https://access.central.example.net/v1/connect/callback#fragment",
         "https://access.central.example.net:8443/v1/connect/callback",
+        "https://access.central.example.net:0/v1/connect/callback",
+        "https://access.central.example.net:/v1/connect/callback",
+        "https://access.central.example.net:0443/v1/connect/callback",
+        "https://access.central.example.net:+443/v1/connect/callback",
         "https://access.central.example.net./v1/connect/callback",
         "https://evil.access.central.example.net/v1/connect/callback",
         "https://access.central.example.net.attacker.com/v1/connect/callback",
@@ -2364,6 +2368,10 @@ class TestExtraRedirectUris:
     def test_platform_suffix_rule_still_applies_when_set(self, central_callback_allowed):
         assert _authorize_with(_REDIRECT_URI).status_code == 302
 
+    def test_explicit_port_and_ipv6_entries_keep_their_port(self):
+        parsed = m._parse_extra_redirect_uris("https://access.example.net:8443/cb,https://[2001:db8::1]:9443/cb")
+        assert parsed == {("https", "access.example.net", 8443, "/cb"), ("https", "2001:db8::1", 9443, "/cb")}
+
     def test_several_entries_with_blanks_and_whitespace(self):
         parsed = m._parse_extra_redirect_uris(f" {_CENTRAL_CALLBACK} ,, https://other.example.net/cb ,")
         assert parsed == {
@@ -2377,6 +2385,9 @@ class TestExtraRedirectUris:
         "https://access.central.example.net/v1/connect/callback#top",
         "https://user@access.central.example.net/v1/connect/callback",
         "https://access.central.example.net:99999/v1/connect/callback",
+        "https://access.central.example.net:0/v1/connect/callback",
+        "https://access.central.example.net:/v1/connect/callback",
+        "https://access.central.example.net:0443/v1/connect/callback",
         "https://access.central.example.net",
         "access.central.example.net/v1/connect/callback",
     ])
