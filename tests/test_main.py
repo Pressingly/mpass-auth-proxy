@@ -2307,3 +2307,124 @@ class TestSigningKeyFromEnvImportTime:
         assert b64 not in captured
         assert b64[:40] not in captured
         assert "-----BEGIN" not in captured
+
+
+_CENTRAL_CALLBACK = "https://access.central.example.net/v1/connect/callback"
+
+
+def _authorize_with(redirect_uri: str):
+    return client.get(
+        "/authorize",
+        params={"state": "central-state", "redirect_uri": redirect_uri, "code_challenge": "challenge-value"},
+        follow_redirects=False,
+    )
+
+
+class TestExtraRedirectUris:
+    @pytest.fixture
+    def central_callback_allowed(self, monkeypatch, fake_redis):
+        monkeypatch.setattr(m, "_EXTRA_REDIRECT_URIS", m._parse_extra_redirect_uris(_CENTRAL_CALLBACK))
+
+    @pytest.mark.parametrize("redirect_uri", [
+        _CENTRAL_CALLBACK,
+        "https://access.central.example.net:443/v1/connect/callback",
+        "https://ACCESS.central.example.net/v1/connect/callback",
+    ])
+    def test_listed_uri_is_accepted(self, central_callback_allowed, redirect_uri):
+        assert _authorize_with(redirect_uri).status_code == 302
+
+    @pytest.mark.parametrize("redirect_uri", [
+        "http://access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net/v1/connect/callback/",
+        "https://access.central.example.net/v1/connect/callbackx",
+        "https://access.central.example.net/v1/connect",
+        "https://access.central.example.net/V1/connect/callback",
+        "https://access.central.example.net/v1/connect/../connect/callback",
+        "https://access.central.example.net/v1/connect/%63allback",
+        "https://access.central.example.net/v1/connect/callback?next=https://attacker.com",
+        "https://access.central.example.net/v1/connect/callback?",
+        "https://access.central.example.net/v1/connect/callback#fragment",
+        "https://access.central.example.net:8443/v1/connect/callback",
+        "https://access.central.example.net:0/v1/connect/callback",
+        "https://access.central.example.net:/v1/connect/callback",
+        "https://access.central.example.net:0443/v1/connect/callback",
+        "https://access.central.example.net:+443/v1/connect/callback",
+        "https://access.central.example.net./v1/connect/callback",
+        "https://evil.access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net.attacker.com/v1/connect/callback",
+        "https://attacker.com@access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net\\@attacker.com/v1/connect/callback",
+        "https://access.central.example.net/v1/connect/call\tback",
+        "https://access.central.example.net/v1/connect/callback\n",
+        "https://access.central.example.net:8443:443/v1/connect/callback",
+        "https://access.central.example.net:443:443/v1/connect/callback",
+        "https://[::1]evil/v1/connect/callback",
+    ])
+    def test_near_misses_are_rejected(self, central_callback_allowed, redirect_uri):
+        assert _authorize_with(redirect_uri).status_code == 400
+
+    def test_unset_leaves_only_the_platform_suffix_rule(self, monkeypatch, fake_redis):
+        monkeypatch.setattr(m, "_EXTRA_REDIRECT_URIS", m._parse_extra_redirect_uris(""))
+        assert _authorize_with(_CENTRAL_CALLBACK).status_code == 400
+        assert _authorize_with(_REDIRECT_URI).status_code == 302
+
+    def test_platform_suffix_rule_still_applies_when_set(self, central_callback_allowed):
+        assert _authorize_with(_REDIRECT_URI).status_code == 302
+
+    @pytest.mark.parametrize("uri", [
+        "https://a.example.net:8443:443/cb",
+        "https://a.example.net:443:443/cb",
+        "https://[::1]:8443]/cb",
+        "https://[::1]x/cb",
+        "https://[::1]evil/cb",
+    ])
+    def test_malformed_netlocs_have_no_key(self, uri):
+        assert m._redirect_key(uri) is None
+
+    def test_explicit_port_and_ipv6_entries_keep_their_port(self):
+        parsed = m._parse_extra_redirect_uris("https://access.example.net:8443/cb,https://[2001:db8::1]:9443/cb")
+        assert parsed == {("https", "access.example.net", 8443, "/cb"), ("https", "2001:db8::1", 9443, "/cb")}
+
+    def test_several_entries_with_blanks_and_whitespace(self):
+        parsed = m._parse_extra_redirect_uris(f" {_CENTRAL_CALLBACK} ,, https://other.example.net/cb ,")
+        assert parsed == {
+            ("https", "access.central.example.net", 443, "/v1/connect/callback"),
+            ("https", "other.example.net", 443, "/cb"),
+        }
+
+    @pytest.mark.parametrize("entry", [
+        "http://access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net/v1/connect/callback?x=1",
+        "https://access.central.example.net/v1/connect/callback#top",
+        "https://user@access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net:99999/v1/connect/callback",
+        "https://access.central.example.net:0/v1/connect/callback",
+        "https://access.central.example.net:/v1/connect/callback",
+        "https://access.central.example.net:0443/v1/connect/callback",
+        "https://access.central.example.net",
+        "access.central.example.net/v1/connect/callback",
+        "https://access.central.example.net:8443:443/v1/connect/callback",
+        "https://[::1]:8443]/v1/connect/callback",
+    ])
+    def test_bad_entry_is_refused(self, entry):
+        with pytest.raises(RuntimeError, match="EXTRA_REDIRECT_URIS entry"):
+            m._parse_extra_redirect_uris(f"{_CENTRAL_CALLBACK},{entry}")
+
+
+class TestExtraRedirectUrisImportTime:
+    """The list is parsed at import, so a bad entry can only be seen refusing
+    to start in a real subprocess."""
+
+    _BASE_ENV = TestEmailCaptureImportTime._BASE_ENV
+    _import_with = TestEmailCaptureImportTime._import_with
+
+    def test_http_entry_refuses_to_start(self):
+        result = self._import_with(EXTRA_REDIRECT_URIS="http://access.central.example.net/v1/connect/callback")
+        assert result.returncode != 0
+        assert "EXTRA_REDIRECT_URIS entry 'http://access.central.example.net/v1/connect/callback'" in result.stderr
+
+    def test_valid_list_starts(self):
+        assert self._import_with(EXTRA_REDIRECT_URIS=_CENTRAL_CALLBACK).returncode == 0
+
+    def test_unset_starts(self):
+        assert self._import_with().returncode == 0
